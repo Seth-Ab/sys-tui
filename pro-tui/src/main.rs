@@ -1,6 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::io;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -87,6 +88,14 @@ struct ModelsResponse {
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
+    id: Option<u64>,
+    role: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct ChatJobResult {
+    placeholder_id: u64,
     role: String,
     content: String,
 }
@@ -110,6 +119,8 @@ struct App {
     input_mode: bool,
     chat_input: String,
     chat_history: VecDeque<ChatMessage>,
+    chat_scroll: usize,
+    next_chat_id: u64,
     selected_model: Option<String>,
     model_list: Vec<String>,
     running_models: Vec<String>,
@@ -131,6 +142,8 @@ impl App {
             input_mode: false,
             chat_input: String::new(),
             chat_history: VecDeque::new(),
+            chat_scroll: 0,
+            next_chat_id: 1,
             selected_model: None,
             model_list: Vec::new(),
             running_models: Vec::new(),
@@ -165,6 +178,8 @@ impl App {
             KeyCode::Char('i') => self.input_mode = true,
             KeyCode::Char('m') => return AppAction::OpenModelSelector,
             KeyCode::Char('r') => return AppAction::Refresh,
+            KeyCode::Up => self.chat_scroll = self.chat_scroll.saturating_sub(1),
+            KeyCode::Down => self.chat_scroll = self.chat_scroll.saturating_add(1),
             _ => {}
         }
 
@@ -221,13 +236,41 @@ impl App {
     }
 
     fn push_chat(&mut self, role: impl Into<String>, content: impl Into<String>) {
+        self.push_chat_with_id(None, role, content);
+    }
+
+    fn push_chat_with_id(
+        &mut self,
+        id: Option<u64>,
+        role: impl Into<String>,
+        content: impl Into<String>,
+    ) {
         self.chat_history.push_back(ChatMessage {
+            id,
             role: role.into(),
             content: content.into(),
         });
         while self.chat_history.len() > CHAT_HISTORY_MAX {
             self.chat_history.pop_front();
         }
+    }
+
+    fn replace_chat_by_id(&mut self, id: u64, role: impl Into<String>, content: impl Into<String>) {
+        let role = role.into();
+        let content = content.into();
+        if let Some(msg) = self
+            .chat_history
+            .iter_mut()
+            .rev()
+            .find(|m| m.id == Some(id))
+        {
+            msg.id = None;
+            msg.role = role;
+            msg.content = content;
+            return;
+        }
+
+        self.push_chat(role, content);
     }
 
     fn chat_endpoint(&self) -> String {
@@ -272,11 +315,15 @@ fn run_app(mut app: App) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let (chat_tx, chat_rx) = mpsc::channel::<ChatJobResult>();
+
     let tick = Duration::from_millis(250);
     let poll_every = Duration::from_secs(1);
     let mut last_poll = Instant::now() - poll_every;
 
     loop {
+        drain_chat_results(&mut app, &chat_rx);
+
         if last_poll.elapsed() >= poll_every {
             poll_state(&client, &mut app);
             last_poll = Instant::now();
@@ -294,9 +341,7 @@ fn run_app(mut app: App) -> Result<()> {
                             last_poll = Instant::now();
                         }
                         AppAction::SendPrompt(prompt) => {
-                            send_prompt(&client, &mut app, prompt);
-                            poll_state(&client, &mut app);
-                            last_poll = Instant::now();
+                            send_prompt(&client, &mut app, &chat_tx, prompt);
                         }
                         AppAction::OpenModelSelector => {
                             open_model_selector(&client, &mut app);
@@ -319,6 +364,12 @@ fn run_app(mut app: App) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn drain_chat_results(app: &mut App, rx: &Receiver<ChatJobResult>) {
+    while let Ok(result) = rx.try_recv() {
+        app.replace_chat_by_id(result.placeholder_id, result.role, result.content);
+    }
 }
 
 fn poll_state(client: &Client, app: &mut App) {
@@ -395,8 +446,12 @@ fn open_model_selector(client: &Client, app: &mut App) {
     }
 }
 
-fn send_prompt(client: &Client, app: &mut App, prompt: String) {
+fn send_prompt(client: &Client, app: &mut App, tx: &Sender<ChatJobResult>, prompt: String) {
     app.push_chat("you", prompt.clone());
+
+    let placeholder_id = app.next_chat_id;
+    app.next_chat_id = app.next_chat_id.saturating_add(1);
+    app.push_chat_with_id(Some(placeholder_id), "assistant", "*working*");
 
     let mut request = client.post(app.chat_endpoint()).json(&ChatRequest {
         prompt,
@@ -406,25 +461,51 @@ fn send_prompt(client: &Client, app: &mut App, prompt: String) {
         request = request.header("x-agent-token", token);
     }
 
-    match request.send() {
-        Ok(resp) if resp.status().is_success() => match resp.json::<ChatResponse>() {
-            Ok(chat) => {
-                if let Some(err) = chat.error {
-                    app.push_chat("error", err);
-                } else if chat.response.trim().is_empty() {
-                    app.push_chat(
-                        "assistant",
-                        format!("({} returned empty response)", chat.model),
-                    );
-                } else {
-                    app.push_chat("assistant", chat.response);
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = match request.send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<ChatResponse>() {
+                Ok(chat) => {
+                    if let Some(err) = chat.error {
+                        ChatJobResult {
+                            placeholder_id,
+                            role: "error".to_string(),
+                            content: err,
+                        }
+                    } else if chat.response.trim().is_empty() {
+                        ChatJobResult {
+                            placeholder_id,
+                            role: "assistant".to_string(),
+                            content: format!("({} returned empty response)", chat.model),
+                        }
+                    } else {
+                        ChatJobResult {
+                            placeholder_id,
+                            role: "assistant".to_string(),
+                            content: chat.response,
+                        }
+                    }
                 }
-            }
-            Err(err) => app.push_chat("error", format!("decode failed: {err}")),
-        },
-        Ok(resp) => app.push_chat("error", format!("chat status {}", resp.status())),
-        Err(err) => app.push_chat("error", format!("chat request failed: {err}")),
-    }
+                Err(err) => ChatJobResult {
+                    placeholder_id,
+                    role: "error".to_string(),
+                    content: format!("decode failed: {err}"),
+                },
+            },
+            Ok(resp) => ChatJobResult {
+                placeholder_id,
+                role: "error".to_string(),
+                content: format!("chat status {}", resp.status()),
+            },
+            Err(err) => ChatJobResult {
+                placeholder_id,
+                role: "error".to_string(),
+                content: format!("chat request failed: {err}"),
+            },
+        };
+
+        let _ = tx.send(result);
+    });
 }
 
 fn ui(frame: &mut ratatui::Frame, app: &App) {
@@ -542,6 +623,10 @@ fn render_help_popup(frame: &mut ratatui::Frame) {
             Line::raw("Up/Down  move selection"),
             Line::raw("Enter    apply model"),
             Line::raw("Esc      close selector"),
+            Line::raw(""),
+            Line::raw("Chat Scroll (normal mode)"),
+            Line::raw("Up       scroll chat up"),
+            Line::raw("Down     scroll chat down"),
         ])
         .block(block("Help"))
         .wrap(Wrap { trim: true }),
@@ -553,8 +638,7 @@ fn render_model_selector_popup(frame: &mut ratatui::Frame, app: &App) {
     let popup = centered_rect(65, 70, frame.area());
     frame.render_widget(Clear, popup);
 
-    let running: std::collections::HashSet<&str> =
-        app.running_models.iter().map(String::as_str).collect();
+    let running: HashSet<&str> = app.running_models.iter().map(String::as_str).collect();
     let effective = app.selected_model.as_deref();
 
     let mut lines = vec![
@@ -616,6 +700,7 @@ fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let chat_window = Paragraph::new(chat_lines(app))
         .block(block("Chat"))
+        .scroll((app.chat_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(chat_window, parts[1]);
 
@@ -747,6 +832,19 @@ fn llm_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatLineKind {
+    Plain,
+    Code,
+    CodeLang,
+}
+
+#[derive(Debug, Clone)]
+struct ChatLine {
+    text: String,
+    kind: ChatLineKind,
+}
+
 fn chat_lines(app: &App) -> Vec<Line<'static>> {
     if app.chat_history.is_empty() {
         return vec![Line::raw(
@@ -754,15 +852,145 @@ fn chat_lines(app: &App) -> Vec<Line<'static>> {
         )];
     }
 
-    app.chat_history
-        .iter()
-        .rev()
-        .take(20)
-        .rev()
-        .map(|m| Line::raw(format!("{}: {}", m.role, m.content)))
-        .collect()
+    let mut out = Vec::new();
+    for msg in app.chat_history.iter().rev().take(20).rev() {
+        let formatted = format_markdown_for_chat(&msg.content);
+        if formatted.is_empty() {
+            out.push(Line::raw(format!("{}:", msg.role)));
+            continue;
+        }
+
+        for (idx, line) in formatted.iter().enumerate() {
+            let prefix = if idx == 0 {
+                format!("{}: ", msg.role)
+            } else {
+                "    ".to_string()
+            };
+
+            let styled = match line.kind {
+                ChatLineKind::Plain => Line::raw(format!("{}{}", prefix, line.text)),
+                ChatLineKind::Code => Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(line.text.clone(), Style::default().fg(Color::Cyan)),
+                ]),
+                ChatLineKind::CodeLang => Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        line.text.clone(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            };
+            out.push(styled);
+        }
+    }
+
+    out
 }
 
+fn format_markdown_for_chat(text: &str) -> Vec<ChatLine> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut in_code = false;
+
+    while i < text.len() {
+        let rem = &text[i..];
+        if let Some(rel) = rem.find("```") {
+            let pos = i + rel;
+            let seg = &text[i..pos];
+            append_segment(seg, in_code, &mut out);
+
+            i = pos + 3;
+            if in_code {
+                in_code = false;
+                out.push(ChatLine {
+                    text: String::new(),
+                    kind: ChatLineKind::Plain,
+                });
+            } else {
+                let (lang, consumed) = parse_fence_lang(&text[i..]);
+                i += consumed;
+                in_code = true;
+                out.push(ChatLine {
+                    text: String::new(),
+                    kind: ChatLineKind::Plain,
+                });
+                if let Some(lang) = lang {
+                    out.push(ChatLine {
+                        text: format!("[{}]", lang),
+                        kind: ChatLineKind::CodeLang,
+                    });
+                }
+            }
+        } else {
+            let seg = &text[i..];
+            append_segment(seg, in_code, &mut out);
+            break;
+        }
+    }
+
+    while out
+        .first()
+        .is_some_and(|l| l.text.is_empty() && l.kind == ChatLineKind::Plain)
+    {
+        out.remove(0);
+    }
+    while out
+        .last()
+        .is_some_and(|l| l.text.is_empty() && l.kind == ChatLineKind::Plain)
+    {
+        out.pop();
+    }
+
+    out
+}
+
+fn parse_fence_lang(input: &str) -> (Option<String>, usize) {
+    if input.is_empty() {
+        return (None, 0);
+    }
+
+    let mut lang = String::new();
+    let mut consumed = 0usize;
+
+    for ch in input.chars() {
+        if ch == '\n' {
+            consumed += ch.len_utf8();
+            break;
+        }
+        if ch.is_whitespace() {
+            consumed += ch.len_utf8();
+            break;
+        }
+        lang.push(ch);
+        consumed += ch.len_utf8();
+    }
+
+    let lang = if lang.is_empty() { None } else { Some(lang) };
+    (lang, consumed)
+}
+
+fn append_segment(seg: &str, in_code: bool, out: &mut Vec<ChatLine>) {
+    if seg.is_empty() {
+        return;
+    }
+
+    for line in seg.split('\n') {
+        if in_code {
+            out.push(ChatLine {
+                text: format!("  | {}", line),
+                kind: ChatLineKind::Code,
+            });
+        } else {
+            out.push(ChatLine {
+                text: line.to_string(),
+                kind: ChatLineKind::Plain,
+            });
+        }
+    }
+}
 fn process_lines(app: &App) -> Vec<Line<'static>> {
     let Some(state) = &app.state else {
         return vec![Line::raw("waiting for first snapshot...".to_string())];

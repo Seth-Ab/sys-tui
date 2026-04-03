@@ -67,12 +67,21 @@ struct AgentState {
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     prompt: String,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     response: String,
     model: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ModelsResponse {
+    selected_model: String,
+    running_models: Vec<String>,
+    installed_models: Vec<String>,
     error: Option<String>,
 }
 
@@ -87,6 +96,8 @@ enum AppAction {
     None,
     Refresh,
     SendPrompt(String),
+    OpenModelSelector,
+    SelectModel(String),
 }
 
 #[derive(Debug)]
@@ -94,10 +105,15 @@ struct App {
     endpoint: String,
     token: Option<String>,
     show_help: bool,
+    show_model_selector: bool,
     expanded_events: bool,
     input_mode: bool,
     chat_input: String,
     chat_history: VecDeque<ChatMessage>,
+    selected_model: Option<String>,
+    model_list: Vec<String>,
+    running_models: Vec<String>,
+    model_hover_idx: usize,
     should_quit: bool,
     state: Option<AgentState>,
     last_error: Option<String>,
@@ -110,10 +126,15 @@ impl App {
             endpoint,
             token,
             show_help: false,
+            show_model_selector: false,
             expanded_events: false,
             input_mode: false,
             chat_input: String::new(),
             chat_history: VecDeque::new(),
+            selected_model: None,
+            model_list: Vec::new(),
+            running_models: Vec::new(),
+            model_hover_idx: 0,
             should_quit: false,
             state: None,
             last_error: None,
@@ -122,15 +143,27 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> AppAction {
+        if self.show_help {
+            if matches!(key.code, KeyCode::Esc) {
+                self.show_help = false;
+            }
+            return AppAction::None;
+        }
+
+        if self.show_model_selector {
+            return self.on_key_model_selector(key);
+        }
+
         if self.input_mode {
             return self.on_key_input_mode(key);
         }
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('h') => self.show_help = !self.show_help,
+            KeyCode::Char('h') => self.show_help = true,
             KeyCode::Char('e') => self.expanded_events = !self.expanded_events,
             KeyCode::Char('i') => self.input_mode = true,
+            KeyCode::Char('m') => return AppAction::OpenModelSelector,
             KeyCode::Char('r') => return AppAction::Refresh,
             _ => {}
         }
@@ -162,6 +195,31 @@ impl App {
         AppAction::None
     }
 
+    fn on_key_model_selector(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Esc => self.show_model_selector = false,
+            KeyCode::Up => {
+                if self.model_hover_idx > 0 {
+                    self.model_hover_idx -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.model_hover_idx + 1 < self.model_list.len() {
+                    self.model_hover_idx += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(model) = self.model_list.get(self.model_hover_idx).cloned() {
+                    self.show_model_selector = false;
+                    return AppAction::SelectModel(model);
+                }
+            }
+            _ => {}
+        }
+
+        AppAction::None
+    }
+
     fn push_chat(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.chat_history.push_back(ChatMessage {
             role: role.into(),
@@ -178,6 +236,23 @@ impl App {
         } else {
             format!("{}/chat", self.endpoint.trim_end_matches('/'))
         }
+    }
+
+    fn models_endpoint(&self) -> String {
+        if let Some(prefix) = self.endpoint.strip_suffix("/state") {
+            format!("{prefix}/models")
+        } else {
+            format!("{}/models", self.endpoint.trim_end_matches('/'))
+        }
+    }
+
+    fn effective_model(&self) -> Option<String> {
+        if let Some(model) = &self.selected_model {
+            return Some(model.clone());
+        }
+        self.state
+            .as_ref()
+            .and_then(|s| s.llm.running_models.first().cloned())
     }
 }
 
@@ -223,6 +298,13 @@ fn run_app(mut app: App) -> Result<()> {
                             poll_state(&client, &mut app);
                             last_poll = Instant::now();
                         }
+                        AppAction::OpenModelSelector => {
+                            open_model_selector(&client, &mut app);
+                        }
+                        AppAction::SelectModel(model) => {
+                            app.selected_model = Some(model.clone());
+                            app.push_chat("system", format!("selected model: {model}"));
+                        }
                     }
                 }
             }
@@ -259,12 +341,67 @@ fn poll_state(client: &Client, app: &mut App) {
     }
 }
 
+fn open_model_selector(client: &Client, app: &mut App) {
+    let mut request = client.get(app.models_endpoint());
+    if let Some(token) = &app.token {
+        request = request.header("x-agent-token", token);
+    }
+
+    match request.send() {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ModelsResponse>() {
+            Ok(models) => {
+                let mut ordered = Vec::new();
+
+                for model in &models.running_models {
+                    if !ordered.contains(model) {
+                        ordered.push(model.clone());
+                    }
+                }
+                for model in &models.installed_models {
+                    if !ordered.contains(model) {
+                        ordered.push(model.clone());
+                    }
+                }
+
+                if ordered.is_empty() {
+                    app.push_chat("error", "no models available from mini-agent /models");
+                    return;
+                }
+
+                app.running_models = models.running_models;
+                app.model_list = ordered;
+                app.show_model_selector = true;
+
+                let selected = app
+                    .selected_model
+                    .clone()
+                    .or_else(|| {
+                        (!models.selected_model.is_empty()).then_some(models.selected_model)
+                    })
+                    .or_else(|| app.effective_model());
+
+                app.model_hover_idx = selected
+                    .and_then(|sel| app.model_list.iter().position(|m| m == &sel))
+                    .unwrap_or(0);
+
+                if let Some(err) = models.error {
+                    app.push_chat("system", format!("models warning: {err}"));
+                }
+            }
+            Err(err) => app.push_chat("error", format!("models decode failed: {err}")),
+        },
+        Ok(resp) => app.push_chat("error", format!("models status {}", resp.status())),
+        Err(err) => app.push_chat("error", format!("models request failed: {err}")),
+    }
+}
+
 fn send_prompt(client: &Client, app: &mut App, prompt: String) {
     app.push_chat("you", prompt.clone());
 
-    let mut request = client
-        .post(app.chat_endpoint())
-        .json(&ChatRequest { prompt });
+    let mut request = client.post(app.chat_endpoint()).json(&ChatRequest {
+        prompt,
+        model: app.selected_model.clone(),
+    });
     if let Some(token) = &app.token {
         request = request.header("x-agent-token", token);
     }
@@ -364,39 +501,101 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
         Span::raw(" expand events  "),
         Span::styled("i", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" chat input  "),
+        Span::styled("m", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" models  "),
         Span::styled("h", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" help"),
     ]));
     frame.render_widget(footer, outer[2]);
 
     if app.show_help {
-        let popup = centered_rect(75, 72, frame.area());
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::raw("pro-tui help"),
-                Line::raw(""),
-                Line::raw("General"),
-                Line::raw("q  quit"),
-                Line::raw("r  refresh immediately"),
-                Line::raw("e  expand/collapse file events"),
-                Line::raw("h  show/hide help"),
-                Line::raw(""),
-                Line::raw("LLM Chat"),
-                Line::raw("i        focus chat input"),
-                Line::raw("Enter    send prompt (when input focused)"),
-                Line::raw("Esc      exit input focus"),
-                Line::raw("Backspace edit input"),
-                Line::raw(""),
-                Line::raw("Env"),
-                Line::raw("AGENT_ENDPOINT  http://mini:8787/state"),
-                Line::raw("AGENT_TOKEN     optional auth token"),
-            ])
-            .block(block("Help"))
-            .wrap(Wrap { trim: true }),
-            popup,
-        );
+        render_help_popup(frame);
     }
+
+    if app.show_model_selector {
+        render_model_selector_popup(frame, app);
+    }
+}
+
+fn render_help_popup(frame: &mut ratatui::Frame) {
+    let popup = centered_rect(75, 74, frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("pro-tui help"),
+            Line::raw(""),
+            Line::raw("General"),
+            Line::raw("q  quit"),
+            Line::raw("r  refresh immediately"),
+            Line::raw("e  expand/collapse file events"),
+            Line::raw("h  open help"),
+            Line::raw("Esc close help"),
+            Line::raw(""),
+            Line::raw("LLM Chat"),
+            Line::raw("i        focus chat input"),
+            Line::raw("Enter    send prompt (when input focused)"),
+            Line::raw("Esc      exit input focus"),
+            Line::raw("Backspace edit input"),
+            Line::raw(""),
+            Line::raw("Model Selector"),
+            Line::raw("m        open model selector"),
+            Line::raw("Up/Down  move selection"),
+            Line::raw("Enter    apply model"),
+            Line::raw("Esc      close selector"),
+        ])
+        .block(block("Help"))
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_model_selector_popup(frame: &mut ratatui::Frame, app: &App) {
+    let popup = centered_rect(65, 70, frame.area());
+    frame.render_widget(Clear, popup);
+
+    let running: std::collections::HashSet<&str> =
+        app.running_models.iter().map(String::as_str).collect();
+    let effective = app.selected_model.as_deref();
+
+    let mut lines = vec![
+        Line::raw("Select model (Enter apply, Esc close)"),
+        Line::raw(""),
+    ];
+
+    for (idx, model) in app.model_list.iter().enumerate() {
+        let prefix = if idx == app.model_hover_idx { ">" } else { " " };
+        let run_mark = if running.contains(model.as_str()) {
+            "[running]"
+        } else {
+            "         "
+        };
+        let sel_mark = if effective == Some(model.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw(format!("{prefix}{sel_mark} {run_mark} ")),
+            if idx == app.model_hover_idx {
+                Span::styled(
+                    model.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(model.clone())
+            },
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block("Models"))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -406,7 +605,7 @@ fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
@@ -528,10 +727,17 @@ fn llm_lines(app: &App) -> Vec<Line<'static>> {
     };
 
     let llm = &state.llm;
+    let selected = app
+        .selected_model
+        .clone()
+        .or_else(|| state.llm.running_models.first().cloned())
+        .unwrap_or_else(|| "(none)".to_string());
+
     let mut lines = vec![
         Line::raw(format!("ollama endpoint: {}", llm.ollama_ps_url)),
         Line::raw(format!("online: {}", llm.ollama_online)),
         Line::raw(format!("running models: {}", llm.model_count)),
+        Line::raw(format!("selected chat model: {selected}")),
     ];
 
     if let Some(err) = &llm.error {
@@ -544,7 +750,7 @@ fn llm_lines(app: &App) -> Vec<Line<'static>> {
 fn chat_lines(app: &App) -> Vec<Line<'static>> {
     if app.chat_history.is_empty() {
         return vec![Line::raw(
-            "No chat messages yet. Press i to start typing.".to_string(),
+            "No chat messages yet. Press i to type, m to choose model.".to_string(),
         )];
     }
 

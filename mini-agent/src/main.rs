@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -69,6 +69,8 @@ struct AppCtx {
     client: Client,
     ollama_chat_url: String,
     ollama_model: String,
+    ollama_ps_url: String,
+    ollama_tags_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -90,12 +92,21 @@ type ProcessHistory = HashMap<String, ProcessHistoryEntry>;
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
     prompt: String,
+    model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatResponse {
     response: String,
     model: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelsResponse {
+    selected_model: String,
+    running_models: Vec<String>,
+    installed_models: Vec<String>,
     error: Option<String>,
 }
 
@@ -106,6 +117,8 @@ async fn main() -> Result<()> {
     let watch_dirs = configured_watch_dirs();
     let ollama_ps_url =
         env::var("OLLAMA_PS_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/api/ps".to_string());
+    let ollama_tags_url = env::var("OLLAMA_TAGS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/tags".to_string());
     let ollama_chat_url = env::var("OLLAMA_CHAT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:11434/api/generate".to_string());
     let ollama_model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
@@ -123,6 +136,7 @@ async fn main() -> Result<()> {
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_events = Arc::clone(&events);
     let collector_client = client.clone();
+    let collector_ps_url = ollama_ps_url.clone();
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         let mut system = System::new_all();
@@ -132,7 +146,7 @@ async fn main() -> Result<()> {
             seq = seq.saturating_add(1);
             let next = collect_snapshot(
                 seq,
-                &ollama_ps_url,
+                &collector_ps_url,
                 &collector_client,
                 &watch_dirs,
                 &collector_events,
@@ -149,12 +163,15 @@ async fn main() -> Result<()> {
         .route("/health", get(health_handler))
         .route("/state", get(state_handler))
         .route("/chat", post(chat_handler))
+        .route("/models", get(models_handler))
         .with_state(AppCtx {
             token,
             snapshot,
             client,
             ollama_chat_url,
             ollama_model,
+            ollama_ps_url,
+            ollama_tags_url,
         });
 
     let addr: SocketAddr = bind_addr.parse()?;
@@ -196,8 +213,16 @@ async fn chat_handler(
         }));
     }
 
+    let selected_model = payload
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&ctx.ollama_model)
+        .to_string();
+
     let req_body = json!({
-        "model": ctx.ollama_model,
+        "model": selected_model,
         "prompt": payload.prompt,
         "stream": false
     });
@@ -211,7 +236,7 @@ async fn chat_handler(
     let Ok(resp) = response else {
         return Ok(Json(ChatResponse {
             response: String::new(),
-            model: ctx.ollama_model.clone(),
+            model: selected_model,
             error: Some("failed to reach ollama".to_string()),
         }));
     };
@@ -220,7 +245,7 @@ async fn chat_handler(
     let Ok(body) = parsed else {
         return Ok(Json(ChatResponse {
             response: String::new(),
-            model: ctx.ollama_model.clone(),
+            model: selected_model,
             error: Some("invalid response from ollama".to_string()),
         }));
     };
@@ -247,6 +272,29 @@ async fn chat_handler(
         response: answer,
         model,
         error: None,
+    }))
+}
+
+async fn models_handler(
+    State(ctx): State<AppCtx>,
+    headers: HeaderMap,
+) -> Result<Json<ModelsResponse>, StatusCode> {
+    authorize(&ctx, &headers)?;
+
+    let running_models = fetch_running_models(&ctx.client, &ctx.ollama_ps_url).await;
+    let installed_models = fetch_installed_models(&ctx.client, &ctx.ollama_tags_url).await;
+
+    let error = if installed_models.is_empty() {
+        Some("no installed models found or ollama unavailable".to_string())
+    } else {
+        None
+    };
+
+    Ok(Json(ModelsResponse {
+        selected_model: ctx.ollama_model.clone(),
+        running_models,
+        installed_models,
+        error,
     }))
 }
 
@@ -428,6 +476,62 @@ async fn collect_llm_metrics(ollama_ps_url: &str, client: &Client) -> LlmMetrics
         running_models,
         error: None,
     }
+}
+
+async fn fetch_running_models(client: &Client, ollama_ps_url: &str) -> Vec<String> {
+    let resp = client.get(ollama_ps_url).send().await;
+    let Ok(resp) = resp else {
+        return Vec::new();
+    };
+    let body = resp.json::<Value>().await;
+    let Ok(body) = body else {
+        return Vec::new();
+    };
+
+    body.get("models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn fetch_installed_models(client: &Client, ollama_tags_url: &str) -> Vec<String> {
+    let resp = client.get(ollama_tags_url).send().await;
+    let Ok(resp) = resp else {
+        return Vec::new();
+    };
+    let body = resp.json::<Value>().await;
+    let Ok(body) = body else {
+        return Vec::new();
+    };
+
+    let models = body
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    dedupe_keep_order(models)
+}
+
+fn dedupe_keep_order(models: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for model in models {
+        if seen.insert(model.clone()) {
+            out.push(model);
+        }
+    }
+    out
 }
 
 fn root_disk_usage() -> (u64, u64) {

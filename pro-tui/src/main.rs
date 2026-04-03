@@ -94,6 +94,8 @@ struct ModelsResponse {
 struct AppConfig {
     global: GlobalConfig,
     dashboard: DashboardConfig,
+    #[serde(default)]
+    themes: BTreeMap<String, ThemePaletteConfig>,
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
 }
@@ -103,6 +105,7 @@ impl Default for AppConfig {
         Self {
             global: GlobalConfig::default(),
             dashboard: DashboardConfig::default(),
+            themes: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
@@ -158,6 +161,61 @@ impl Default for DashboardConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl ThemeColor {
+    fn from_u8(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    fn to_display_color(self) -> Color {
+        nearest_ansi_color(self)
+    }
+}
+
+impl Default for ThemeColor {
+    fn default() -> Self {
+        Self {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemePaletteConfig {
+    main_text_color: ThemeColor,
+    secondary_text_color: ThemeColor,
+    border_color: ThemeColor,
+    section_title_color: ThemeColor,
+    focus_color: ThemeColor,
+    title_color: ThemeColor,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+impl Default for ThemePaletteConfig {
+    fn default() -> Self {
+        Self {
+            main_text_color: ThemeColor::from_u8(255, 255, 255),
+            secondary_text_color: ThemeColor::from_u8(150, 150, 150),
+            border_color: ThemeColor::from_u8(0, 170, 130),
+            section_title_color: ThemeColor::from_u8(100, 255, 220),
+            focus_color: ThemeColor::from_u8(100, 255, 220),
+            title_color: ThemeColor::from_u8(0, 166, 128),
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DashboardLayoutPreset {
@@ -189,6 +247,7 @@ enum Screen {
 enum CustomizeSection {
     Global,
     Dashboard,
+    Themes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +266,37 @@ enum DashboardOption {
     ShowSystem,
     ShowProcesses,
     ShowEvents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeColorField {
+    MainText,
+    SecondaryText,
+    Border,
+    SectionTitle,
+    Focus,
+    Title,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemesOption {
+    EditorTheme,
+    NewThemeName,
+    CreateTheme,
+    ColorPick(ThemeColorField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorPickerRow {
+    Base,
+    Shade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomizeTextTarget {
+    DashboardAssistantName,
+    DashboardUserName,
+    ThemeNewName,
 }
 
 #[derive(Debug)]
@@ -252,8 +342,18 @@ struct App {
     customize_section_idx: usize,
     global_option_idx: usize,
     dashboard_option_idx: usize,
+    themes_option_idx: usize,
+    theme_editor_name: String,
+    theme_new_name: String,
     customize_text_mode: bool,
     customize_text_buffer: String,
+    customize_text_target: Option<CustomizeTextTarget>,
+    show_color_picker: bool,
+    color_picker_field: Option<ThemeColorField>,
+    color_picker_row: ColorPickerRow,
+    color_picker_idx: usize,
+    color_picker_shade_idx: usize,
+    color_picker_preview: bool,
     should_quit: bool,
     state: Option<AgentState>,
     last_error: Option<String>,
@@ -267,6 +367,7 @@ impl App {
         config_path: PathBuf,
         config: AppConfig,
     ) -> Self {
+        let current_theme = config.global.theme.clone();
         Self {
             endpoint,
             token,
@@ -292,8 +393,18 @@ impl App {
             customize_section_idx: 0,
             global_option_idx: 0,
             dashboard_option_idx: 0,
+            themes_option_idx: 0,
+            theme_editor_name: current_theme,
+            theme_new_name: String::new(),
             customize_text_mode: false,
             customize_text_buffer: String::new(),
+            customize_text_target: None,
+            show_color_picker: false,
+            color_picker_field: None,
+            color_picker_row: ColorPickerRow::Base,
+            color_picker_idx: 0,
+            color_picker_shade_idx: 8,
+            color_picker_preview: false,
             should_quit: false,
             state: None,
             last_error: None,
@@ -314,6 +425,10 @@ impl App {
             self.show_navigator = true;
             self.input_mode = false;
             self.customize_text_mode = false;
+            self.customize_text_target = None;
+            self.show_color_picker = false;
+            self.color_picker_preview = false;
+            self.color_picker_field = None;
             self.navigator_hover_idx = Self::screen_index(self.active_screen);
             return AppAction::None;
         }
@@ -335,9 +450,16 @@ impl App {
                 self.input_mode = false;
                 return AppAction::None;
             }
+            if self.show_color_picker {
+                self.show_color_picker = false;
+                self.color_picker_preview = false;
+                self.color_picker_field = None;
+                return AppAction::None;
+            }
             if self.customize_text_mode {
                 self.customize_text_mode = false;
                 self.customize_text_buffer.clear();
+                self.customize_text_target = None;
                 return AppAction::None;
             }
         }
@@ -352,6 +474,10 @@ impl App {
 
         if self.show_model_selector {
             return self.on_key_model_selector(key);
+        }
+
+        if self.show_color_picker {
+            return self.on_key_color_picker(key);
         }
 
         if self.input_mode {
@@ -456,6 +582,93 @@ impl App {
         AppAction::None
     }
 
+    fn on_key_color_picker(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_color_picker = false;
+                self.color_picker_preview = false;
+                self.color_picker_field = None;
+            }
+            KeyCode::Up => {
+                self.color_picker_row = ColorPickerRow::Base;
+            }
+            KeyCode::Down => {
+                self.color_picker_row = ColorPickerRow::Shade;
+            }
+            KeyCode::Left => match self.color_picker_row {
+                ColorPickerRow::Base => {
+                    if self.color_picker_idx > 0 {
+                        self.color_picker_idx -= 1;
+                    }
+                }
+                ColorPickerRow::Shade => {
+                    if self.color_picker_shade_idx > 0 {
+                        self.color_picker_shade_idx -= 1;
+                    }
+                }
+            },
+            KeyCode::Right => match self.color_picker_row {
+                ColorPickerRow::Base => {
+                    if self.color_picker_idx + 1 < ansi_swatches().len() {
+                        self.color_picker_idx += 1;
+                    }
+                }
+                ColorPickerRow::Shade => {
+                    if self.color_picker_shade_idx < 15 {
+                        self.color_picker_shade_idx += 1;
+                    }
+                }
+            },
+            KeyCode::Char('t') => {
+                self.color_picker_preview = !self.color_picker_preview;
+            }
+            KeyCode::Enter => {
+                if let Some(field) = self.color_picker_field {
+                    let picked = self.color_picker_current_color();
+                    if let Some(dst) = self.theme_color_for_editor_mut(field) {
+                        *dst = picked;
+                        self.config_dirty = true;
+                    }
+                }
+                self.show_color_picker = false;
+                self.color_picker_preview = false;
+                self.color_picker_field = None;
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn open_color_picker_for_field(&mut self, field: ThemeColorField) {
+        let current = self.theme_color_for_editor(field).unwrap_or_default();
+        let base_idx = nearest_ansi_index(current);
+        self.show_color_picker = true;
+        self.color_picker_field = Some(field);
+        self.color_picker_preview = false;
+        self.color_picker_row = ColorPickerRow::Base;
+        self.color_picker_idx = base_idx;
+        self.color_picker_shade_idx = nearest_shade_index(base_idx, current);
+    }
+
+    fn color_picker_current_color(&self) -> ThemeColor {
+        match self.color_picker_row {
+            ColorPickerRow::Base => ansi_theme_color_at(self.color_picker_idx),
+            ColorPickerRow::Shade => {
+                let shades = shade_gradient_for_base(self.color_picker_idx);
+                shades[self.color_picker_shade_idx.min(15)]
+            }
+        }
+    }
+
+    fn theme_preview_override(&self) -> Option<(ThemeColorField, ThemeColor)> {
+        if self.show_color_picker && self.color_picker_preview {
+            self.color_picker_field
+                .map(|f| (f, self.color_picker_current_color()))
+        } else {
+            None
+        }
+    }
+
     fn on_key_customize(&mut self, key: KeyEvent) -> AppAction {
         match key.code {
             KeyCode::Char('[') => self.prev_customize_section(),
@@ -478,6 +691,7 @@ impl App {
             KeyCode::Esc => {
                 self.customize_text_mode = false;
                 self.customize_text_buffer.clear();
+                self.customize_text_target = None;
             }
             KeyCode::Backspace => {
                 self.customize_text_buffer.pop();
@@ -487,6 +701,7 @@ impl App {
                 self.apply_selected_text_value(value);
                 self.customize_text_mode = false;
                 self.customize_text_buffer.clear();
+                self.customize_text_target = None;
             }
             KeyCode::Char(c) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -521,6 +736,10 @@ impl App {
                 let max = Self::dashboard_options().len().saturating_sub(1);
                 self.dashboard_option_idx = step_index(self.dashboard_option_idx, max, delta);
             }
+            CustomizeSection::Themes => {
+                let max = self.themes_options().len().saturating_sub(1);
+                self.themes_option_idx = step_index(self.themes_option_idx, max, delta);
+            }
         }
     }
 
@@ -528,7 +747,9 @@ impl App {
         match self.active_customize_section() {
             CustomizeSection::Global => {
                 if self.active_global_option() == GlobalOption::Theme {
-                    self.config.global.theme = rotate_theme(&self.config.global.theme, delta);
+                    let names = self.available_theme_names();
+                    self.config.global.theme =
+                        rotate_name_owned(&names, &self.config.global.theme, delta);
                     self.config_dirty = true;
                 }
             }
@@ -566,6 +787,7 @@ impl App {
                 }
                 DashboardOption::AssistantName | DashboardOption::UserName => {}
             },
+            CustomizeSection::Themes => self.adjust_theme_option(delta),
         }
     }
 
@@ -608,6 +830,7 @@ impl App {
                     self.config.dashboard.show_events = defaults.dashboard.show_events
                 }
             },
+            CustomizeSection::Themes => self.reset_theme_option(),
         }
 
         self.config_dirty = true;
@@ -617,21 +840,26 @@ impl App {
         match self.active_customize_section() {
             CustomizeSection::Global => {
                 if self.active_global_option() == GlobalOption::Theme {
-                    self.config.global.theme = rotate_theme(&self.config.global.theme, 1);
+                    let names = self.available_theme_names();
+                    self.config.global.theme =
+                        rotate_name_owned(&names, &self.config.global.theme, 1);
                     self.config_dirty = true;
                 }
             }
             CustomizeSection::Dashboard => match self.active_dashboard_option() {
                 DashboardOption::AssistantName => {
                     self.customize_text_mode = true;
+                    self.customize_text_target = Some(CustomizeTextTarget::DashboardAssistantName);
                     self.customize_text_buffer = self.config.dashboard.assistant_name.clone();
                 }
                 DashboardOption::UserName => {
                     self.customize_text_mode = true;
+                    self.customize_text_target = Some(CustomizeTextTarget::DashboardUserName);
                     self.customize_text_buffer = self.config.dashboard.user_name.clone();
                 }
                 _ => self.adjust_selected_customize_value(1),
             },
+            CustomizeSection::Themes => self.enter_theme_option(),
         }
     }
 
@@ -640,19 +868,133 @@ impl App {
             return;
         }
 
-        if self.active_customize_section() == CustomizeSection::Dashboard {
-            match self.active_dashboard_option() {
-                DashboardOption::AssistantName => {
-                    self.config.dashboard.assistant_name = value;
-                    self.config_dirty = true;
-                }
-                DashboardOption::UserName => {
-                    self.config.dashboard.user_name = value;
-                    self.config_dirty = true;
-                }
-                _ => {}
+        match self.customize_text_target {
+            Some(CustomizeTextTarget::DashboardAssistantName) => {
+                self.config.dashboard.assistant_name = value;
+                self.config_dirty = true;
+            }
+            Some(CustomizeTextTarget::DashboardUserName) => {
+                self.config.dashboard.user_name = value;
+                self.config_dirty = true;
+            }
+            Some(CustomizeTextTarget::ThemeNewName) => {
+                self.theme_new_name = value;
+            }
+            None => {}
+        }
+    }
+
+    fn available_theme_names(&self) -> Vec<String> {
+        let mut out = builtin_theme_names();
+        for k in self.config.themes.keys() {
+            if !out.iter().any(|n| n == k) {
+                out.push(k.clone());
             }
         }
+        out
+    }
+
+    fn themes_options(&self) -> Vec<ThemesOption> {
+        let mut out = vec![
+            ThemesOption::EditorTheme,
+            ThemesOption::NewThemeName,
+            ThemesOption::CreateTheme,
+        ];
+        for field in [
+            ThemeColorField::MainText,
+            ThemeColorField::SecondaryText,
+            ThemeColorField::Border,
+            ThemeColorField::SectionTitle,
+            ThemeColorField::Focus,
+            ThemeColorField::Title,
+        ] {
+            out.push(ThemesOption::ColorPick(field));
+        }
+        out
+    }
+
+    fn active_themes_option(&self) -> ThemesOption {
+        let opts = self.themes_options();
+        opts[self.themes_option_idx.min(opts.len().saturating_sub(1))]
+    }
+
+    fn adjust_theme_option(&mut self, delta: i32) {
+        match self.active_themes_option() {
+            ThemesOption::EditorTheme => {
+                let names = self.available_theme_names();
+                self.theme_editor_name = rotate_name_owned(&names, &self.theme_editor_name, delta);
+            }
+            ThemesOption::NewThemeName | ThemesOption::CreateTheme | ThemesOption::ColorPick(_) => {
+            }
+        }
+    }
+
+    fn reset_theme_option(&mut self) {
+        match self.active_themes_option() {
+            ThemesOption::EditorTheme => {}
+            ThemesOption::NewThemeName => self.theme_new_name.clear(),
+            ThemesOption::CreateTheme => {}
+            ThemesOption::ColorPick(field) => {
+                let default_cfg = builtin_theme_config(&self.theme_editor_name)
+                    .unwrap_or_else(ThemePaletteConfig::default);
+                if let Some(dst) = self.theme_color_for_editor_mut(field) {
+                    *dst = theme_color_from_field(&default_cfg, field);
+                }
+            }
+        }
+    }
+
+    fn enter_theme_option(&mut self) {
+        match self.active_themes_option() {
+            ThemesOption::EditorTheme => self.adjust_theme_option(1),
+            ThemesOption::NewThemeName => {
+                self.customize_text_mode = true;
+                self.customize_text_target = Some(CustomizeTextTarget::ThemeNewName);
+                self.customize_text_buffer = self.theme_new_name.clone();
+            }
+            ThemesOption::CreateTheme => {
+                let name = self.theme_new_name.trim().to_string();
+                if name.is_empty() {
+                    self.set_status_message("set new theme name first");
+                    return;
+                }
+                let seed = self
+                    .config
+                    .themes
+                    .get(&self.theme_editor_name)
+                    .cloned()
+                    .or_else(|| builtin_theme_config(&self.theme_editor_name))
+                    .unwrap_or_else(ThemePaletteConfig::default);
+                self.config.themes.insert(name.clone(), seed);
+                self.theme_editor_name = name.clone();
+                self.config.global.theme = name;
+                self.config_dirty = true;
+                self.set_status_message("created theme");
+            }
+            ThemesOption::ColorPick(field) => self.open_color_picker_for_field(field),
+        }
+    }
+
+    fn theme_color_for_editor(&self, field: ThemeColorField) -> Option<ThemeColor> {
+        let cfg = self
+            .config
+            .themes
+            .get(&self.theme_editor_name)
+            .cloned()
+            .or_else(|| builtin_theme_config(&self.theme_editor_name))
+            .unwrap_or_else(ThemePaletteConfig::default);
+        Some(theme_color_from_field(&cfg, field))
+    }
+
+    fn theme_color_for_editor_mut(&mut self, field: ThemeColorField) -> Option<&mut ThemeColor> {
+        let name = self.theme_editor_name.clone();
+        if !self.config.themes.contains_key(&name) {
+            let seed = builtin_theme_config(&name).unwrap_or_else(ThemePaletteConfig::default);
+            self.config.themes.insert(name.clone(), seed);
+        }
+
+        let cfg = self.config.themes.get_mut(&name)?;
+        Some(theme_color_from_field_mut(cfg, field))
     }
 
     fn active_customize_section(&self) -> CustomizeSection {
@@ -698,8 +1040,12 @@ impl App {
         [Screen::Dashboard, Screen::Customize]
     }
 
-    fn customize_sections() -> [CustomizeSection; 2] {
-        [CustomizeSection::Global, CustomizeSection::Dashboard]
+    fn customize_sections() -> [CustomizeSection; 3] {
+        [
+            CustomizeSection::Global,
+            CustomizeSection::Dashboard,
+            CustomizeSection::Themes,
+        ]
     }
 
     fn global_options() -> [GlobalOption; 1] {
@@ -865,6 +1211,10 @@ fn run_app(mut app: App) -> Result<()> {
                             app.input_mode = false;
                             app.customize_text_mode = false;
                             app.customize_text_buffer.clear();
+                            app.customize_text_target = None;
+                            app.show_color_picker = false;
+                            app.color_picker_preview = false;
+                            app.color_picker_field = None;
                         }
                         AppAction::SaveConfig => {
                             let (normalized, warnings) = normalize_config(app.config.clone());
@@ -971,7 +1321,16 @@ fn save_config(path: &PathBuf, cfg: &AppConfig) -> Result<()> {
 fn normalize_config(mut cfg: AppConfig) -> (AppConfig, Vec<String>) {
     let mut warnings = Vec::new();
 
-    if !theme_names().contains(&cfg.global.theme.as_str()) {
+    let known = {
+        let mut names = builtin_theme_names();
+        for k in cfg.themes.keys() {
+            if !names.iter().any(|n| n == k) {
+                names.push(k.clone());
+            }
+        }
+        names
+    };
+    if !known.iter().any(|n| n == &cfg.global.theme) {
         warnings.push(format!("theme '{}' invalid -> default", cfg.global.theme));
         cfg.global.theme = GlobalConfig::default().theme;
     }
@@ -1157,13 +1516,21 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
         ])
         .split(frame.area());
 
-    let badge_bg = theme_badge_bg(&app.config.global.theme);
+    let palette = active_theme_palette(app);
     let title = Paragraph::new(Line::from(vec![
-        Span::styled(" pro-tui ", Style::default().fg(Color::Black).bg(badge_bg)),
-        Span::raw(format!(
-            " Mac Pro dashboard for Mac mini agent  |  Screen: {}",
-            App::screen_name(app.active_screen)
-        )),
+        Span::styled(
+            " pro-tui ",
+            Style::default()
+                .fg(palette.title_text_color)
+                .bg(palette.title_color),
+        ),
+        Span::styled(
+            format!(
+                " Mac Pro dashboard for Mac mini agent  |  Screen: {}",
+                App::screen_name(app.active_screen)
+            ),
+            Style::default().fg(palette.main_text_color),
+        ),
     ]));
     frame.render_widget(title, outer[0]);
 
@@ -1215,7 +1582,8 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
         ]);
     }
 
-    let footer = Paragraph::new(Line::from(footer_spans));
+    let footer = Paragraph::new(Line::from(footer_spans))
+        .style(Style::default().fg(palette.secondary_text_color));
     frame.render_widget(footer, outer[2]);
 
     if app.show_help {
@@ -1228,6 +1596,10 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
 
     if app.show_navigator {
         render_navigator_popup(frame, app);
+    }
+
+    if app.show_color_picker {
+        render_color_picker_popup(frame, app);
     }
 }
 
@@ -1264,13 +1636,13 @@ fn render_dashboard_three_top_two_bottom(frame: &mut ratatui::Frame, app: &App, 
     if app.config.dashboard.show_status {
         frame.render_widget(
             Paragraph::new(status_lines(app))
-                .block(block("Status"))
+                .block(block("Status", app))
                 .wrap(Wrap { trim: true }),
             top_left[0],
         );
     } else {
         frame.render_widget(
-            Paragraph::new("hidden (toggle in Customize)").block(block("Status")),
+            Paragraph::new("hidden (toggle in Customize)").block(block("Status", app)),
             top_left[0],
         );
     }
@@ -1278,13 +1650,13 @@ fn render_dashboard_three_top_two_bottom(frame: &mut ratatui::Frame, app: &App, 
     if app.config.dashboard.show_system {
         frame.render_widget(
             Paragraph::new(system_lines(app))
-                .block(block("System"))
+                .block(block("System", app))
                 .wrap(Wrap { trim: true }),
             top_left[1],
         );
     } else {
         frame.render_widget(
-            Paragraph::new("hidden (toggle in Customize)").block(block("System")),
+            Paragraph::new("hidden (toggle in Customize)").block(block("System", app)),
             top_left[1],
         );
     }
@@ -1292,7 +1664,7 @@ fn render_dashboard_three_top_two_bottom(frame: &mut ratatui::Frame, app: &App, 
     if app.config.dashboard.show_processes && top.len() > 1 {
         frame.render_widget(
             Paragraph::new(process_lines(app))
-                .block(block("Top Processes"))
+                .block(block("Top Processes", app))
                 .wrap(Wrap { trim: true }),
             top[1],
         );
@@ -1315,7 +1687,7 @@ fn render_dashboard_three_top_two_bottom(frame: &mut ratatui::Frame, app: &App, 
     if app.config.dashboard.show_events && bottom.len() > 1 {
         frame.render_widget(
             Paragraph::new(event_lines(app))
-                .block(block("File Events"))
+                .block(block("File Events", app))
                 .wrap(Wrap { trim: true }),
             bottom[1],
         );
@@ -1360,13 +1732,13 @@ fn render_dashboard_llm_column(frame: &mut ratatui::Frame, app: &App, area: Rect
     if app.config.dashboard.show_status {
         frame.render_widget(
             Paragraph::new(status_lines(app))
-                .block(block("Status"))
+                .block(block("Status", app))
                 .wrap(Wrap { trim: true }),
             top_left[0],
         );
     } else {
         frame.render_widget(
-            Paragraph::new("hidden (toggle in Customize)").block(block("Status")),
+            Paragraph::new("hidden (toggle in Customize)").block(block("Status", app)),
             top_left[0],
         );
     }
@@ -1374,13 +1746,13 @@ fn render_dashboard_llm_column(frame: &mut ratatui::Frame, app: &App, area: Rect
     if app.config.dashboard.show_system {
         frame.render_widget(
             Paragraph::new(system_lines(app))
-                .block(block("System"))
+                .block(block("System", app))
                 .wrap(Wrap { trim: true }),
             top_left[1],
         );
     } else {
         frame.render_widget(
-            Paragraph::new("hidden (toggle in Customize)").block(block("System")),
+            Paragraph::new("hidden (toggle in Customize)").block(block("System", app)),
             top_left[1],
         );
     }
@@ -1388,7 +1760,7 @@ fn render_dashboard_llm_column(frame: &mut ratatui::Frame, app: &App, area: Rect
     if app.config.dashboard.show_processes && top.len() > 1 {
         frame.render_widget(
             Paragraph::new(process_lines(app))
-                .block(block("Top Processes"))
+                .block(block("Top Processes", app))
                 .wrap(Wrap { trim: true }),
             top[1],
         );
@@ -1397,7 +1769,7 @@ fn render_dashboard_llm_column(frame: &mut ratatui::Frame, app: &App, area: Rect
     if app.config.dashboard.show_events && right.len() > 1 {
         frame.render_widget(
             Paragraph::new(event_lines(app))
-                .block(block("File Events"))
+                .block(block("File Events", app))
                 .wrap(Wrap { trim: true }),
             right[1],
         );
@@ -1405,6 +1777,7 @@ fn render_dashboard_llm_column(frame: &mut ratatui::Frame, app: &App, area: Rect
 }
 
 fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let palette = active_theme_palette(app);
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
@@ -1420,6 +1793,7 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         let label = match section {
             CustomizeSection::Global => "Global",
             CustomizeSection::Dashboard => "Dashboard",
+            CustomizeSection::Themes => "Themes",
         };
         section_lines.push(if idx == app.customize_section_idx {
             Line::from(vec![
@@ -1427,7 +1801,7 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette.focus_color)
                         .add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -1438,7 +1812,7 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(section_lines)
-            .block(block("Customize"))
+            .block(block("Customize", app))
             .wrap(Wrap { trim: true }),
         layout[0],
     );
@@ -1446,9 +1820,7 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut option_lines: Vec<Line<'static>> = vec![
         Line::raw("Use [ and ] to switch section".to_string()),
         Line::raw("Up/Down select option, Left/Right change value".to_string()),
-        Line::raw("Enter on assistant_name/user_name: start inline edit".to_string()),
-        Line::raw("Enter while editing: apply text, Esc: cancel inline edit".to_string()),
-        Line::raw("s saves all changes, r resets selected option to default".to_string()),
+        Line::raw("Enter: edit/apply current option, s: save all, r: reset selected".to_string()),
         Line::raw("".to_string()),
     ];
 
@@ -1459,7 +1831,13 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 let value = match option {
                     GlobalOption::Theme => app.config.global.theme.clone(),
                 };
-                option_lines.push(customize_option_line(selected, false, "theme", &value));
+                option_lines.push(customize_option_line(
+                    selected,
+                    false,
+                    "theme",
+                    &value,
+                    palette.focus_color,
+                ));
             }
         }
         CustomizeSection::Dashboard => {
@@ -1518,7 +1896,86 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     editing,
                     name,
                     &display_value,
+                    palette.focus_color,
                 ));
+            }
+        }
+        CustomizeSection::Themes => {
+            option_lines.push(Line::raw(
+                "Themes creator: edit current theme or create a new one".to_string(),
+            ));
+            option_lines.push(Line::raw(
+                "Colors are ANSI-only (Enter opens picker)".to_string(),
+            ));
+            option_lines.push(Line::raw("".to_string()));
+
+            for (idx, opt) in app.themes_options().iter().enumerate() {
+                let selected = idx == app.themes_option_idx;
+                let prefix = if selected { "> " } else { "  " };
+                let value_style = if selected {
+                    Style::default()
+                        .fg(palette.focus_color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.main_text_color)
+                };
+
+                match opt {
+                    ThemesOption::EditorTheme => {
+                        let value = if app.theme_editor_name == app.config.global.theme {
+                            format!("{} (active)", app.theme_editor_name)
+                        } else {
+                            app.theme_editor_name.clone()
+                        };
+                        option_lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled("editor_theme: ".to_string(), value_style),
+                            Span::styled(value, value_style),
+                        ]));
+                    }
+                    ThemesOption::NewThemeName => {
+                        let editing = app.customize_text_mode
+                            && selected
+                            && app.customize_text_target == Some(CustomizeTextTarget::ThemeNewName);
+                        let value = if editing {
+                            format!("{}_", app.customize_text_buffer)
+                        } else {
+                            app.theme_new_name.clone()
+                        };
+                        option_lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled("new_theme_name: ".to_string(), value_style),
+                            Span::styled(value, value_style),
+                        ]));
+                    }
+                    ThemesOption::CreateTheme => {
+                        option_lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled("create_theme".to_string(), value_style),
+                        ]));
+                    }
+
+                    ThemesOption::ColorPick(field) => {
+                        let c = app.theme_color_for_editor(*field).unwrap_or_default();
+                        let ansi_name = ansi_swatch_name(nearest_ansi_index(c));
+                        let swatch = Span::styled(
+                            "  ██  ".to_string(),
+                            Style::default()
+                                .bg(c.to_display_color())
+                                .fg(c.to_display_color()),
+                        );
+                        option_lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled(
+                                format!("{}: ", theme_color_field_name(*field)),
+                                value_style,
+                            ),
+                            Span::styled(ansi_name.to_string(), value_style),
+                            Span::raw(" ".to_string()),
+                            swatch,
+                        ]));
+                    }
+                }
             }
         }
     }
@@ -1542,13 +1999,115 @@ fn render_customize_screen(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(option_lines)
-            .block(block("Options"))
+            .block(block("Options", app))
             .wrap(Wrap { trim: true }),
         layout[1],
     );
 }
 
+fn render_color_picker_popup(frame: &mut ratatui::Frame, app: &App) {
+    let popup = centered_rect(78, 34, frame.area());
+    frame.render_widget(Clear, popup);
+
+    let Some(field) = app.color_picker_field else {
+        return;
+    };
+
+    let base_idx = app
+        .color_picker_idx
+        .min(ansi_swatches().len().saturating_sub(1));
+    let shade_idx = app.color_picker_shade_idx.min(15);
+    let shades = shade_gradient_for_base(base_idx);
+    let current = match app.color_picker_row {
+        ColorPickerRow::Base => ansi_theme_color_at(base_idx),
+        ColorPickerRow::Shade => shades[shade_idx],
+    };
+
+    let mut base_row: Vec<Span<'static>> = Vec::new();
+    let mut base_name_row: Vec<Span<'static>> = Vec::new();
+    for (idx, sw) in ansi_swatches().iter().enumerate() {
+        let selected = app.color_picker_row == ColorPickerRow::Base && idx == base_idx;
+        let style = if selected {
+            Style::default()
+                .bg(sw.color)
+                .fg(sw.color)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().bg(sw.color).fg(sw.color)
+        };
+        base_row.push(Span::styled("██".to_string(), style));
+        base_row.push(Span::raw(" ".to_string()));
+
+        let name_style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        base_name_row.push(Span::styled(format!("{} ", sw.short), name_style));
+    }
+
+    let mut shade_row: Vec<Span<'static>> = Vec::new();
+    let mut shade_label_row: Vec<Span<'static>> = Vec::new();
+    for (idx, shade) in shades.iter().enumerate() {
+        let selected = app.color_picker_row == ColorPickerRow::Shade && idx == shade_idx;
+        let swatch_color = shade.to_display_color();
+        let style = if selected {
+            Style::default()
+                .bg(swatch_color)
+                .fg(swatch_color)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().bg(swatch_color).fg(swatch_color)
+        };
+        shade_row.push(Span::styled("██".to_string(), style));
+        shade_row.push(Span::raw(" ".to_string()));
+
+        let label_style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        shade_label_row.push(Span::styled(format!("{:02} ", idx + 1), label_style));
+    }
+
+    let rendered_name = match app.color_picker_row {
+        ColorPickerRow::Base => ansi_swatch_name(base_idx).to_string(),
+        ColorPickerRow::Shade => {
+            format!("{} shade {:02}", ansi_swatch_name(base_idx), shade_idx + 1)
+        }
+    };
+
+    let lines = vec![
+        Line::raw(
+            "ANSI Color Picker (Up/Down row, Left/Right move, Enter apply, Esc cancel, t preview)",
+        ),
+        Line::raw("Top row: 16 base ANSI colors"),
+        Line::raw("Bottom row: 16 shades around selected base"),
+        Line::raw(""),
+        Line::from(base_row),
+        Line::from(base_name_row),
+        Line::raw(""),
+        Line::from(shade_row),
+        Line::from(shade_label_row),
+        Line::raw(""),
+        Line::raw(format!("Field: {}", theme_color_field_name(field))),
+        Line::raw(format!("Rendered as: {}", rendered_name)),
+        Line::raw(format!("RGB: {}, {}, {}", current.r, current.g, current.b)),
+        Line::raw(format!(
+            "Preview (relevant elements only): {}",
+            bool_label(app.color_picker_preview)
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block("Color Picker", app))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
 fn render_navigator_popup(frame: &mut ratatui::Frame, app: &App) {
+    let palette = active_theme_palette(app);
     let popup = centered_rect(45, 45, frame.area());
     frame.render_widget(Clear, popup);
 
@@ -1575,7 +2134,7 @@ fn render_navigator_popup(frame: &mut ratatui::Frame, app: &App) {
                 Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette.focus_color)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -1586,7 +2145,7 @@ fn render_navigator_popup(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block("Screens"))
+            .block(block("Screens", app))
             .wrap(Wrap { trim: true }),
         popup,
     );
@@ -1623,21 +2182,23 @@ fn render_help_popup(frame: &mut ratatui::Frame, app: &App) {
             Line::raw("Esc      close selector"),
             Line::raw(""),
             Line::raw("Customize screen"),
-            Line::raw("[ / ]    switch section"),
+            Line::raw("[ / ]    switch section (Global/Dashboard/Themes)"),
             Line::raw("Up/Down  move option"),
-            Line::raw("Left/Right change value"),
-            Line::raw("Enter    inline edit/apply text fields"),
+            Line::raw("Left/Right change value (theme/option)"),
+            Line::raw("Enter    edit/apply selected option"),
             Line::raw("s        save all Customize changes to config"),
             Line::raw("r        reset selected option to default"),
-            Line::raw("Esc      cancel inline text edit"),
+            Line::raw("Esc      cancel inline text edit / close color picker"),
+            Line::raw("Color picker: Up/Down row, Left/Right move, Enter apply, t preview"),
         ])
-        .block(block("Help"))
+        .block(block("Help", app))
         .wrap(Wrap { trim: true }),
         popup,
     );
 }
 
 fn render_model_selector_popup(frame: &mut ratatui::Frame, app: &App) {
+    let palette = active_theme_palette(app);
     let popup = centered_rect(65, 70, frame.area());
     frame.render_widget(Clear, popup);
 
@@ -1668,7 +2229,7 @@ fn render_model_selector_popup(frame: &mut ratatui::Frame, app: &App) {
                 Span::styled(
                     model.clone(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette.focus_color)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -1679,15 +2240,16 @@ fn render_model_selector_popup(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block("Models"))
+            .block(block("Models", app))
             .wrap(Wrap { trim: true }),
         popup,
     );
 }
 
 fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let outer = block("LLM").inner(area);
-    frame.render_widget(block("LLM"), area);
+    let palette = active_theme_palette(app);
+    let outer = block("LLM", app).inner(area);
+    frame.render_widget(block("LLM", app), area);
 
     let parts = Layout::default()
         .direction(Direction::Vertical)
@@ -1698,11 +2260,13 @@ fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         ])
         .split(outer);
 
-    let llm_summary = Paragraph::new(llm_lines(app)).wrap(Wrap { trim: true });
+    let llm_summary = Paragraph::new(llm_lines(app))
+        .style(Style::default().fg(palette.main_text_color))
+        .wrap(Wrap { trim: true });
     frame.render_widget(llm_summary, parts[0]);
 
     let chat_window = Paragraph::new(chat_lines(app))
-        .block(block("Chat"))
+        .block(block("Chat", app))
         .scroll((app.chat_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(chat_window, parts[1]);
@@ -1713,25 +2277,39 @@ fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         "Input (press i to focus)"
     };
     let input_style = if app.input_mode {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette.focus_color)
     } else {
-        Style::default()
+        Style::default().fg(palette.main_text_color)
     };
 
     let input = Paragraph::new(format!("> {}", app.chat_input))
-        .block(Block::default().borders(Borders::ALL).title(input_title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.border_color))
+                .title(Span::styled(
+                    input_title.to_string(),
+                    Style::default()
+                        .fg(palette.section_title_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
         .style(input_style)
         .wrap(Wrap { trim: true });
     frame.render_widget(input, parts[2]);
 }
 
-fn block(title: &str) -> Block<'_> {
-    Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" {} ", title),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ))
+fn block(title: &'static str, app: &App) -> Block<'static> {
+    let palette = active_theme_palette(app);
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.border_color))
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default()
+                .fg(palette.section_title_color)
+                .add_modifier(Modifier::BOLD),
+        ))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2087,21 +2665,410 @@ fn role_display(app: &App, role: &str) -> (String, Style) {
     }
 }
 
-fn theme_badge_bg(theme: &str) -> Color {
-    match theme {
-        "amber" => Color::Yellow,
-        "ocean" => Color::Blue,
-        "mono" => Color::Gray,
-        _ => Color::Green,
+fn active_theme_palette(app: &App) -> ThemePalette {
+    theme_palette(
+        &app.config,
+        &app.config.global.theme,
+        app.theme_preview_override(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemePalette {
+    main_text_color: Color,
+    secondary_text_color: Color,
+    border_color: Color,
+    section_title_color: Color,
+    focus_color: Color,
+    title_color: Color,
+    title_text_color: Color,
+}
+
+fn theme_palette(
+    config: &AppConfig,
+    theme: &str,
+    preview: Option<(ThemeColorField, ThemeColor)>,
+) -> ThemePalette {
+    let mut cfg = resolve_theme_palette_config(config, theme);
+    if let Some((field, color)) = preview {
+        *theme_color_from_field_mut(&mut cfg, field) = color;
+    }
+
+    ThemePalette {
+        main_text_color: cfg.main_text_color.to_display_color(),
+        secondary_text_color: cfg.secondary_text_color.to_display_color(),
+        border_color: cfg.border_color.to_display_color(),
+        section_title_color: cfg.section_title_color.to_display_color(),
+        focus_color: cfg.focus_color.to_display_color(),
+        title_color: cfg.title_color.to_display_color(),
+        title_text_color: theme_title_text_color(cfg.title_color),
     }
 }
 
-fn theme_names() -> &'static [&'static str] {
-    &["default", "amber", "ocean", "mono"]
+fn theme_title_text_color(c: ThemeColor) -> Color {
+    let luminance = 0.2126 * f64::from(c.r) + 0.7152 * f64::from(c.g) + 0.0722 * f64::from(c.b);
+    if luminance > 140.0 {
+        Color::Black
+    } else {
+        Color::White
+    }
 }
 
-fn rotate_theme(current: &str, delta: i32) -> String {
-    rotate_name(theme_names(), current, delta).to_string()
+#[derive(Debug, Clone, Copy)]
+struct AnsiSwatch {
+    name: &'static str,
+    short: &'static str,
+    color: Color,
+    rgb: ThemeColor,
+}
+
+fn ansi_swatches() -> &'static [AnsiSwatch] {
+    const S: &[AnsiSwatch] = &[
+        AnsiSwatch {
+            name: "Black",
+            short: "Bk",
+            color: Color::Black,
+            rgb: ThemeColor { r: 0, g: 0, b: 0 },
+        },
+        AnsiSwatch {
+            name: "DarkGray",
+            short: "Dg",
+            color: Color::DarkGray,
+            rgb: ThemeColor {
+                r: 85,
+                g: 85,
+                b: 85,
+            },
+        },
+        AnsiSwatch {
+            name: "Gray",
+            short: "Gy",
+            color: Color::Gray,
+            rgb: ThemeColor {
+                r: 170,
+                g: 170,
+                b: 170,
+            },
+        },
+        AnsiSwatch {
+            name: "White",
+            short: "Wh",
+            color: Color::White,
+            rgb: ThemeColor {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+        },
+        AnsiSwatch {
+            name: "Red",
+            short: "Rd",
+            color: Color::Red,
+            rgb: ThemeColor {
+                r: 205,
+                g: 49,
+                b: 49,
+            },
+        },
+        AnsiSwatch {
+            name: "LightRed",
+            short: "LR",
+            color: Color::LightRed,
+            rgb: ThemeColor {
+                r: 241,
+                g: 76,
+                b: 76,
+            },
+        },
+        AnsiSwatch {
+            name: "Green",
+            short: "Gn",
+            color: Color::Green,
+            rgb: ThemeColor {
+                r: 13,
+                g: 188,
+                b: 121,
+            },
+        },
+        AnsiSwatch {
+            name: "LightGreen",
+            short: "LG",
+            color: Color::LightGreen,
+            rgb: ThemeColor {
+                r: 35,
+                g: 209,
+                b: 139,
+            },
+        },
+        AnsiSwatch {
+            name: "Yellow",
+            short: "Yl",
+            color: Color::Yellow,
+            rgb: ThemeColor {
+                r: 229,
+                g: 229,
+                b: 16,
+            },
+        },
+        AnsiSwatch {
+            name: "LightYellow",
+            short: "LY",
+            color: Color::LightYellow,
+            rgb: ThemeColor {
+                r: 245,
+                g: 245,
+                b: 67,
+            },
+        },
+        AnsiSwatch {
+            name: "Blue",
+            short: "Bl",
+            color: Color::Blue,
+            rgb: ThemeColor {
+                r: 36,
+                g: 114,
+                b: 200,
+            },
+        },
+        AnsiSwatch {
+            name: "LightBlue",
+            short: "LB",
+            color: Color::LightBlue,
+            rgb: ThemeColor {
+                r: 59,
+                g: 142,
+                b: 234,
+            },
+        },
+        AnsiSwatch {
+            name: "Magenta",
+            short: "Mg",
+            color: Color::Magenta,
+            rgb: ThemeColor {
+                r: 188,
+                g: 63,
+                b: 188,
+            },
+        },
+        AnsiSwatch {
+            name: "LightMagenta",
+            short: "LM",
+            color: Color::LightMagenta,
+            rgb: ThemeColor {
+                r: 214,
+                g: 112,
+                b: 214,
+            },
+        },
+        AnsiSwatch {
+            name: "Cyan",
+            short: "Cy",
+            color: Color::Cyan,
+            rgb: ThemeColor {
+                r: 17,
+                g: 168,
+                b: 205,
+            },
+        },
+        AnsiSwatch {
+            name: "LightCyan",
+            short: "LC",
+            color: Color::LightCyan,
+            rgb: ThemeColor {
+                r: 41,
+                g: 184,
+                b: 219,
+            },
+        },
+    ];
+    S
+}
+
+fn nearest_ansi_index(c: ThemeColor) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_dist = i64::MAX;
+    for (idx, sw) in ansi_swatches().iter().enumerate() {
+        let dr = i64::from(c.r) - i64::from(sw.rgb.r);
+        let dg = i64::from(c.g) - i64::from(sw.rgb.g);
+        let db = i64::from(c.b) - i64::from(sw.rgb.b);
+        let dist = dr * dr + dg * dg + db * db;
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+fn ansi_theme_color_at(idx: usize) -> ThemeColor {
+    ansi_swatches()[idx.min(ansi_swatches().len().saturating_sub(1))].rgb
+}
+
+fn ansi_swatch_name(idx: usize) -> &'static str {
+    ansi_swatches()[idx.min(ansi_swatches().len().saturating_sub(1))].name
+}
+
+fn blend_theme_color(a: ThemeColor, b: ThemeColor, t: f32) -> ThemeColor {
+    fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+        let af = f32::from(a);
+        let bf = f32::from(b);
+        let v = af + (bf - af) * t.clamp(0.0, 1.0);
+        v.round().clamp(0.0, 255.0) as u8
+    }
+
+    ThemeColor {
+        r: lerp_u8(a.r, b.r, t),
+        g: lerp_u8(a.g, b.g, t),
+        b: lerp_u8(a.b, b.b, t),
+    }
+}
+
+fn shade_gradient_for_base(base_idx: usize) -> [ThemeColor; 16] {
+    let base = ansi_theme_color_at(base_idx);
+    let mut out = [base; 16];
+
+    // 0..6: progressively darker (0 is darkest), 7: original color.
+    for idx in 0..7 {
+        let amt_to_black = (7 - idx) as f32 / 8.0;
+        out[idx] = blend_theme_color(base, ThemeColor::from_u8(0, 0, 0), amt_to_black);
+    }
+    out[7] = base;
+
+    // 8..15: progressively lighter (15 is lightest).
+    for idx in 8..16 {
+        let amt_to_white = (idx - 7) as f32 / 8.0;
+        out[idx] = blend_theme_color(base, ThemeColor::from_u8(255, 255, 255), amt_to_white);
+    }
+
+    out
+}
+
+fn nearest_shade_index(base_idx: usize, current: ThemeColor) -> usize {
+    let shades = shade_gradient_for_base(base_idx);
+    let mut best = 0usize;
+    let mut best_dist = i64::MAX;
+    for (idx, c) in shades.iter().enumerate() {
+        let dr = i64::from(current.r) - i64::from(c.r);
+        let dg = i64::from(current.g) - i64::from(c.g);
+        let db = i64::from(current.b) - i64::from(c.b);
+        let dist = dr * dr + dg * dg + db * db;
+        if dist < best_dist {
+            best = idx;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+fn nearest_ansi_color(c: ThemeColor) -> Color {
+    ansi_swatches()[nearest_ansi_index(c)].color
+}
+
+fn builtin_theme_names() -> Vec<String> {
+    vec![
+        "default".to_string(),
+        "amber".to_string(),
+        "ocean".to_string(),
+        "mono".to_string(),
+    ]
+}
+
+fn builtin_theme_config(name: &str) -> Option<ThemePaletteConfig> {
+    let cfg = match name {
+        "amber" => ThemePaletteConfig {
+            main_text_color: ThemeColor::from_u8(255, 255, 255),
+            secondary_text_color: ThemeColor::from_u8(160, 160, 160),
+            border_color: ThemeColor::from_u8(255, 215, 64),
+            section_title_color: ThemeColor::from_u8(255, 215, 64),
+            focus_color: ThemeColor::from_u8(255, 235, 140),
+            title_color: ThemeColor::from_u8(255, 215, 64),
+            extra: BTreeMap::new(),
+        },
+        "ocean" => ThemePaletteConfig {
+            main_text_color: ThemeColor::from_u8(255, 255, 255),
+            secondary_text_color: ThemeColor::from_u8(160, 160, 160),
+            border_color: ThemeColor::from_u8(64, 133, 255),
+            section_title_color: ThemeColor::from_u8(130, 200, 255),
+            focus_color: ThemeColor::from_u8(130, 255, 255),
+            title_color: ThemeColor::from_u8(64, 133, 255),
+            extra: BTreeMap::new(),
+        },
+        "mono" => ThemePaletteConfig {
+            main_text_color: ThemeColor::from_u8(255, 255, 255),
+            secondary_text_color: ThemeColor::from_u8(160, 160, 160),
+            border_color: ThemeColor::from_u8(140, 140, 140),
+            section_title_color: ThemeColor::from_u8(255, 255, 255),
+            focus_color: ThemeColor::from_u8(255, 255, 255),
+            title_color: ThemeColor::from_u8(140, 140, 140),
+            extra: BTreeMap::new(),
+        },
+        "default" => ThemePaletteConfig {
+            main_text_color: ThemeColor::from_u8(255, 255, 255),
+            secondary_text_color: ThemeColor::from_u8(160, 160, 160),
+            border_color: ThemeColor::from_u8(40, 180, 140),
+            section_title_color: ThemeColor::from_u8(120, 255, 220),
+            focus_color: ThemeColor::from_u8(120, 255, 220),
+            title_color: ThemeColor::from_u8(40, 180, 140),
+            extra: BTreeMap::new(),
+        },
+        _ => return None,
+    };
+    Some(cfg)
+}
+
+fn resolve_theme_palette_config(config: &AppConfig, theme: &str) -> ThemePaletteConfig {
+    config
+        .themes
+        .get(theme)
+        .cloned()
+        .or_else(|| builtin_theme_config(theme))
+        .unwrap_or_else(ThemePaletteConfig::default)
+}
+
+fn theme_color_field_name(field: ThemeColorField) -> &'static str {
+    match field {
+        ThemeColorField::MainText => "main_text_color",
+        ThemeColorField::SecondaryText => "secondary_text_color",
+        ThemeColorField::Border => "border_color",
+        ThemeColorField::SectionTitle => "section_title_color",
+        ThemeColorField::Focus => "focus_color",
+        ThemeColorField::Title => "title_color",
+    }
+}
+
+fn theme_color_from_field(cfg: &ThemePaletteConfig, field: ThemeColorField) -> ThemeColor {
+    match field {
+        ThemeColorField::MainText => cfg.main_text_color,
+        ThemeColorField::SecondaryText => cfg.secondary_text_color,
+        ThemeColorField::Border => cfg.border_color,
+        ThemeColorField::SectionTitle => cfg.section_title_color,
+        ThemeColorField::Focus => cfg.focus_color,
+        ThemeColorField::Title => cfg.title_color,
+    }
+}
+
+fn theme_color_from_field_mut(
+    cfg: &mut ThemePaletteConfig,
+    field: ThemeColorField,
+) -> &mut ThemeColor {
+    match field {
+        ThemeColorField::MainText => &mut cfg.main_text_color,
+        ThemeColorField::SecondaryText => &mut cfg.secondary_text_color,
+        ThemeColorField::Border => &mut cfg.border_color,
+        ThemeColorField::SectionTitle => &mut cfg.section_title_color,
+        ThemeColorField::Focus => &mut cfg.focus_color,
+        ThemeColorField::Title => &mut cfg.title_color,
+    }
+}
+
+fn rotate_name_owned(items: &[String], current: &str, delta: i32) -> String {
+    if items.is_empty() {
+        return current.to_string();
+    }
+    let len = items.len() as i32;
+    let idx = items.iter().position(|n| n == current).unwrap_or(0) as i32;
+    let next = (idx + delta).rem_euclid(len) as usize;
+    items[next].clone()
 }
 
 fn color_names() -> &'static [&'static str] {
@@ -2178,13 +3145,19 @@ fn layout_preset_label(layout: DashboardLayoutPreset) -> &'static str {
     }
 }
 
-fn customize_option_line(selected: bool, editing: bool, name: &str, value: &str) -> Line<'static> {
+fn customize_option_line(
+    selected: bool,
+    editing: bool,
+    name: &str,
+    value: &str,
+    focus_color: Color,
+) -> Line<'static> {
     if selected {
         let mut style = Style::default()
-            .fg(Color::Cyan)
+            .fg(focus_color)
             .add_modifier(Modifier::BOLD);
         if editing {
-            style = style.fg(Color::LightCyan);
+            style = style.add_modifier(Modifier::UNDERLINED);
         }
         Line::from(vec![
             Span::raw("> ".to_string()),

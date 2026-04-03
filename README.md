@@ -5,14 +5,36 @@ Split Rust TUI system for a Mac mini (agent) and Mac Pro (viewer).
 - `mini-agent`: runs on the Mac mini, collects system + LLM + file-event telemetry, serves JSON.
 - `pro-tui`: runs on the Mac Pro, polls the agent and renders a live dashboard.
 
-## Quick Start (with token)
+## Quick Start (scripts)
+
+1. Create local config:
+```bash
+cd /Users/sethabramowitz/cs-projects/sys-tui
+cp .env.local.example .env.local
+```
+
+2. Edit `.env.local` with your values (`AGENT_BIND`, `AGENT_ENDPOINT`, `AGENT_TOKEN`, etc).
+
+3. On Mac mini, run agent:
+```bash
+cd /Users/sethabramowitz/cs-projects/sys-tui
+./scripts/run-mini-agent.sh
+```
+
+4. On Mac Pro, run dashboard:
+```bash
+cd /Users/sethabramowitz/cs-projects/sys-tui
+./scripts/run-pro-tui.sh
+```
+
+## Quick Start (manual env)
 
 ### 1) On Mac mini: start `mini-agent`
 
 ```bash
-cd sys-tui
+cd /Users/sethabramowitz/cs-projects/sys-tui
 TOKEN="$(openssl rand -hex 32)"
-AGENT_BIND=<ipv4>:8787 AGENT_TOKEN="$TOKEN" cargo run -p mini-agent
+AGENT_BIND=0.0.0.0:8787 AGENT_TOKEN="$TOKEN" cargo run -p mini-agent
 ```
 
 Notes:
@@ -25,9 +47,13 @@ Notes:
 ### 2) On Mac Pro: run `pro-tui`
 
 ```bash
-cd sys-tui
+cd /Users/sethabramowitz/cs-projects/sys-tui
 AGENT_ENDPOINT=http://<mini-host-or-ip>:8787/state AGENT_TOKEN="<same-token>" cargo run -p pro-tui
 ```
+
+Notes:
+- `AGENT_ENDPOINT` is a URL, so hostname is fine here (for example `core`, `core.local`, or Tailscale DNS name), as long as it resolves.
+- Example: `AGENT_ENDPOINT=http://core:8787/state`
 
 ## Without token
 

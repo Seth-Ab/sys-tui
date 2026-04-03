@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -8,21 +8,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sysinfo::{Disks, System};
 use tokio::sync::RwLock;
+
+const PROCESS_WINDOW_MS: u128 = 5 * 60 * 1000;
+const TOP_PROCESS_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ProcessInfo {
     pid: u32,
     name: String,
     cpu_percent: f32,
+    current_cpu_percent: f32,
     memory_bytes: u64,
+    samples_5m: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,6 +66,37 @@ struct AgentState {
 struct AppCtx {
     token: Option<String>,
     snapshot: Arc<RwLock<AgentState>>,
+    client: Client,
+    ollama_chat_url: String,
+    ollama_model: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessSample {
+    ts_ms: u128,
+    cpu_percent: f32,
+    memory_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessHistoryEntry {
+    pid: u32,
+    name: String,
+    samples: VecDeque<ProcessSample>,
+}
+
+type ProcessHistory = HashMap<String, ProcessHistoryEntry>;
+
+#[derive(Debug, Deserialize)]
+struct ChatRequest {
+    prompt: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponse {
+    response: String,
+    model: String,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -70,6 +106,9 @@ async fn main() -> Result<()> {
     let watch_dirs = configured_watch_dirs();
     let ollama_ps_url =
         env::var("OLLAMA_PS_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/api/ps".to_string());
+    let ollama_chat_url = env::var("OLLAMA_CHAT_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/generate".to_string());
+    let ollama_model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
 
     let events = Arc::new(Mutex::new(VecDeque::with_capacity(200)));
     let _watcher = start_file_watcher(&watch_dirs, Arc::clone(&events))?;
@@ -79,17 +118,28 @@ async fn main() -> Result<()> {
         ..Default::default()
     }));
 
+    let client = Client::new();
+
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_events = Arc::clone(&events);
+    let collector_client = client.clone();
     tokio::spawn(async move {
-        let client = Client::new();
         let mut seq: u64 = 0;
+        let mut system = System::new_all();
+        let mut process_history: ProcessHistory = HashMap::new();
 
         loop {
             seq = seq.saturating_add(1);
-            let next =
-                collect_snapshot(seq, &ollama_ps_url, &client, &watch_dirs, &collector_events)
-                    .await;
+            let next = collect_snapshot(
+                seq,
+                &ollama_ps_url,
+                &collector_client,
+                &watch_dirs,
+                &collector_events,
+                &mut system,
+                &mut process_history,
+            )
+            .await;
             *collector_snapshot.write().await = next;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -98,7 +148,14 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/state", get(state_handler))
-        .with_state(AppCtx { token, snapshot });
+        .route("/chat", post(chat_handler))
+        .with_state(AppCtx {
+            token,
+            snapshot,
+            client,
+            ollama_chat_url,
+            ollama_model,
+        });
 
     let addr: SocketAddr = bind_addr.parse()?;
     println!("mini-agent listening on http://{addr}");
@@ -119,6 +176,81 @@ async fn state_handler(
     State(ctx): State<AppCtx>,
     headers: HeaderMap,
 ) -> Result<Json<AgentState>, StatusCode> {
+    authorize(&ctx, &headers)?;
+    let snapshot = ctx.snapshot.read().await.clone();
+    Ok(Json(snapshot))
+}
+
+async fn chat_handler(
+    State(ctx): State<AppCtx>,
+    headers: HeaderMap,
+    Json(payload): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, StatusCode> {
+    authorize(&ctx, &headers)?;
+
+    if payload.prompt.trim().is_empty() {
+        return Ok(Json(ChatResponse {
+            response: String::new(),
+            model: ctx.ollama_model.clone(),
+            error: Some("prompt is empty".to_string()),
+        }));
+    }
+
+    let req_body = json!({
+        "model": ctx.ollama_model,
+        "prompt": payload.prompt,
+        "stream": false
+    });
+
+    let response = ctx
+        .client
+        .post(&ctx.ollama_chat_url)
+        .json(&req_body)
+        .send()
+        .await;
+    let Ok(resp) = response else {
+        return Ok(Json(ChatResponse {
+            response: String::new(),
+            model: ctx.ollama_model.clone(),
+            error: Some("failed to reach ollama".to_string()),
+        }));
+    };
+
+    let parsed = resp.json::<Value>().await;
+    let Ok(body) = parsed else {
+        return Ok(Json(ChatResponse {
+            response: String::new(),
+            model: ctx.ollama_model.clone(),
+            error: Some("invalid response from ollama".to_string()),
+        }));
+    };
+
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ctx.ollama_model)
+        .to_string();
+
+    let answer = body
+        .get("response")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            body.get("message")
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+
+    Ok(Json(ChatResponse {
+        response: answer,
+        model,
+        error: None,
+    }))
+}
+
+fn authorize(ctx: &AppCtx, headers: &HeaderMap) -> Result<(), StatusCode> {
     if let Some(expected) = &ctx.token {
         let provided = headers
             .get("x-agent-token")
@@ -129,9 +261,7 @@ async fn state_handler(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-
-    let snapshot = ctx.snapshot.read().await.clone();
-    Ok(Json(snapshot))
+    Ok(())
 }
 
 async fn collect_snapshot(
@@ -140,8 +270,10 @@ async fn collect_snapshot(
     client: &Client,
     watch_dirs: &[String],
     events: &Arc<Mutex<VecDeque<String>>>,
+    system: &mut System,
+    process_history: &mut ProcessHistory,
 ) -> AgentState {
-    let mut system = System::new_all();
+    let ts_ms = now_ms();
     system.refresh_all();
 
     let cpu_percent = system.global_cpu_usage();
@@ -150,18 +282,8 @@ async fn collect_snapshot(
     let swap_total_bytes = system.total_swap();
     let swap_used_bytes = system.used_swap();
 
-    let mut top_processes: Vec<ProcessInfo> = system
-        .processes()
-        .iter()
-        .map(|(pid, proc_)| ProcessInfo {
-            pid: pid.as_u32(),
-            name: proc_.name().to_string_lossy().into_owned(),
-            cpu_percent: proc_.cpu_usage(),
-            memory_bytes: proc_.memory(),
-        })
-        .collect();
-    top_processes.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
-    top_processes.truncate(10);
+    update_process_history(system, process_history, ts_ms);
+    let top_processes = compute_top_processes(process_history, ts_ms);
 
     let (root_total_bytes, root_used_bytes) = root_disk_usage();
 
@@ -169,7 +291,7 @@ async fn collect_snapshot(
 
     AgentState {
         seq,
-        ts_ms: now_ms(),
+        ts_ms,
         hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
         watched_dirs: watch_dirs.to_vec(),
         recent_file_events: read_recent_events(events, 20),
@@ -185,6 +307,84 @@ async fn collect_snapshot(
         },
         llm,
     }
+}
+
+fn update_process_history(system: &System, history: &mut ProcessHistory, ts_ms: u128) {
+    for (pid, proc_) in system.processes() {
+        let key = process_key(pid.as_u32(), proc_.start_time());
+        let entry = history.entry(key).or_insert_with(|| ProcessHistoryEntry {
+            pid: pid.as_u32(),
+            name: proc_.name().to_string_lossy().into_owned(),
+            samples: VecDeque::new(),
+        });
+
+        entry.pid = pid.as_u32();
+        entry.name = proc_.name().to_string_lossy().into_owned();
+        entry.samples.push_back(ProcessSample {
+            ts_ms,
+            cpu_percent: proc_.cpu_usage(),
+            memory_bytes: proc_.memory(),
+        });
+
+        prune_old_samples(&mut entry.samples, ts_ms);
+    }
+
+    history.retain(|_, entry| {
+        prune_old_samples(&mut entry.samples, ts_ms);
+        !entry.samples.is_empty()
+    });
+}
+
+fn compute_top_processes(history: &ProcessHistory, ts_ms: u128) -> Vec<ProcessInfo> {
+    let mut out: Vec<ProcessInfo> = history
+        .values()
+        .filter_map(|entry| {
+            let valid_samples: Vec<&ProcessSample> = entry
+                .samples
+                .iter()
+                .filter(|s| ts_ms.saturating_sub(s.ts_ms) <= PROCESS_WINDOW_MS)
+                .collect();
+
+            if valid_samples.is_empty() {
+                return None;
+            }
+
+            let sum_cpu: f32 = valid_samples.iter().map(|s| s.cpu_percent).sum();
+            let avg_cpu = sum_cpu / valid_samples.len() as f32;
+            let current = valid_samples.last().copied()?;
+
+            Some(ProcessInfo {
+                pid: entry.pid,
+                name: entry.name.clone(),
+                cpu_percent: avg_cpu,
+                current_cpu_percent: current.cpu_percent,
+                memory_bytes: current.memory_bytes,
+                samples_5m: valid_samples.len() as u32,
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.cpu_percent
+            .total_cmp(&a.cpu_percent)
+            .then_with(|| b.current_cpu_percent.total_cmp(&a.current_cpu_percent))
+    });
+    out.truncate(TOP_PROCESS_COUNT);
+    out
+}
+
+fn prune_old_samples(samples: &mut VecDeque<ProcessSample>, now_ms: u128) {
+    while samples
+        .front()
+        .map(|s| now_ms.saturating_sub(s.ts_ms) > PROCESS_WINDOW_MS)
+        .unwrap_or(false)
+    {
+        samples.pop_front();
+    }
+}
+
+fn process_key(pid: u32, start_time: u64) -> String {
+    format!("{pid}:{start_time}")
 }
 
 async fn collect_llm_metrics(ollama_ps_url: &str, client: &Client) -> LlmMetrics {
@@ -280,7 +480,7 @@ fn start_file_watcher(
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let line = format!("{} [{}] {}", now_ms(), format!("{:?}", event.kind), paths);
+                let line = format!("{} [{:?}] {}", now_ms(), event.kind, paths);
                 queue.push_back(line);
                 while queue.len() > 200 {
                     queue.pop_front();

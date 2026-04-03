@@ -1,9 +1,10 @@
+use std::collections::VecDeque;
 use std::env;
 use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -15,14 +16,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+const CHAT_HISTORY_MAX: usize = 100;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ProcessInfo {
     pid: u32,
     name: String,
     cpu_percent: f32,
+    #[serde(default)]
+    current_cpu_percent: f32,
     memory_bytes: u64,
+    #[serde(default)]
+    samples_5m: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -57,12 +64,40 @@ struct AgentState {
     llm: LlmMetrics,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatRequest {
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    response: String,
+    model: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug)]
+enum AppAction {
+    None,
+    Refresh,
+    SendPrompt(String),
+}
+
 #[derive(Debug)]
 struct App {
     endpoint: String,
     token: Option<String>,
     show_help: bool,
     expanded_events: bool,
+    input_mode: bool,
+    chat_input: String,
+    chat_history: VecDeque<ChatMessage>,
     should_quit: bool,
     state: Option<AgentState>,
     last_error: Option<String>,
@@ -76,6 +111,9 @@ impl App {
             token,
             show_help: false,
             expanded_events: false,
+            input_mode: false,
+            chat_input: String::new(),
+            chat_history: VecDeque::new(),
             should_quit: false,
             state: None,
             last_error: None,
@@ -83,15 +121,63 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, key: KeyCode) -> bool {
-        match key {
+    fn on_key(&mut self, key: KeyEvent) -> AppAction {
+        if self.input_mode {
+            return self.on_key_input_mode(key);
+        }
+
+        match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('h') => self.show_help = !self.show_help,
             KeyCode::Char('e') => self.expanded_events = !self.expanded_events,
-            KeyCode::Char('r') => return true,
+            KeyCode::Char('i') => self.input_mode = true,
+            KeyCode::Char('r') => return AppAction::Refresh,
             _ => {}
         }
-        false
+
+        AppAction::None
+    }
+
+    fn on_key_input_mode(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Esc => self.input_mode = false,
+            KeyCode::Enter => {
+                let prompt = self.chat_input.trim().to_string();
+                self.chat_input.clear();
+                if !prompt.is_empty() {
+                    return AppAction::SendPrompt(prompt);
+                }
+            }
+            KeyCode::Backspace => {
+                self.chat_input.pop();
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.chat_input.push(c);
+                }
+            }
+            _ => {}
+        }
+
+        AppAction::None
+    }
+
+    fn push_chat(&mut self, role: impl Into<String>, content: impl Into<String>) {
+        self.chat_history.push_back(ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        });
+        while self.chat_history.len() > CHAT_HISTORY_MAX {
+            self.chat_history.pop_front();
+        }
+    }
+
+    fn chat_endpoint(&self) -> String {
+        if let Some(prefix) = self.endpoint.strip_suffix("/state") {
+            format!("{prefix}/chat")
+        } else {
+            format!("{}/chat", self.endpoint.trim_end_matches('/'))
+        }
     }
 }
 
@@ -110,9 +196,7 @@ fn run_app(mut app: App) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_millis(800))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
     let tick = Duration::from_millis(250);
     let poll_every = Duration::from_secs(1);
     let mut last_poll = Instant::now() - poll_every;
@@ -128,10 +212,17 @@ fn run_app(mut app: App) -> Result<()> {
         if event::poll(tick)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    let manual_refresh = app.on_key(key.code);
-                    if manual_refresh {
-                        poll_state(&client, &mut app);
-                        last_poll = Instant::now();
+                    match app.on_key(key) {
+                        AppAction::None => {}
+                        AppAction::Refresh => {
+                            poll_state(&client, &mut app);
+                            last_poll = Instant::now();
+                        }
+                        AppAction::SendPrompt(prompt) => {
+                            send_prompt(&client, &mut app, prompt);
+                            poll_state(&client, &mut app);
+                            last_poll = Instant::now();
+                        }
                     }
                 }
             }
@@ -168,6 +259,37 @@ fn poll_state(client: &Client, app: &mut App) {
     }
 }
 
+fn send_prompt(client: &Client, app: &mut App, prompt: String) {
+    app.push_chat("you", prompt.clone());
+
+    let mut request = client
+        .post(app.chat_endpoint())
+        .json(&ChatRequest { prompt });
+    if let Some(token) = &app.token {
+        request = request.header("x-agent-token", token);
+    }
+
+    match request.send() {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ChatResponse>() {
+            Ok(chat) => {
+                if let Some(err) = chat.error {
+                    app.push_chat("error", err);
+                } else if chat.response.trim().is_empty() {
+                    app.push_chat(
+                        "assistant",
+                        format!("({} returned empty response)", chat.model),
+                    );
+                } else {
+                    app.push_chat("assistant", chat.response);
+                }
+            }
+            Err(err) => app.push_chat("error", format!("decode failed: {err}")),
+        },
+        Ok(resp) => app.push_chat("error", format!("chat status {}", resp.status())),
+        Err(err) => app.push_chat("error", format!("chat request failed: {err}")),
+    }
+}
+
 fn ui(frame: &mut ratatui::Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -189,47 +311,43 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
 
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(outer[1]);
 
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(body[0]);
+
+    let top_left = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(top[0]);
 
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(body[1]);
 
     frame.render_widget(
         Paragraph::new(status_lines(app))
             .block(block("Status"))
             .wrap(Wrap { trim: true }),
-        top[0],
+        top_left[0],
     );
     frame.render_widget(
         Paragraph::new(system_lines(app))
             .block(block("System"))
             .wrap(Wrap { trim: true }),
-        top[1],
-    );
-    frame.render_widget(
-        Paragraph::new(llm_lines(app))
-            .block(block("LLM"))
-            .wrap(Wrap { trim: true }),
-        top[2],
+        top_left[1],
     );
     frame.render_widget(
         Paragraph::new(process_lines(app))
             .block(block("Top Processes"))
             .wrap(Wrap { trim: true }),
-        bottom[0],
+        top[1],
     );
+    render_llm_panel(frame, app, bottom[0]);
     frame.render_widget(
         Paragraph::new(event_lines(app))
             .block(block("File Events"))
@@ -244,23 +362,31 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
         Span::raw(" refresh  "),
         Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" expand events  "),
+        Span::styled("i", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" chat input  "),
         Span::styled("h", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" help"),
     ]));
     frame.render_widget(footer, outer[2]);
 
     if app.show_help {
-        let popup = centered_rect(70, 65, frame.area());
+        let popup = centered_rect(75, 72, frame.area());
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw("pro-tui help"),
                 Line::raw(""),
-                Line::raw("Keybinds"),
+                Line::raw("General"),
                 Line::raw("q  quit"),
                 Line::raw("r  refresh immediately"),
                 Line::raw("e  expand/collapse file events"),
                 Line::raw("h  show/hide help"),
+                Line::raw(""),
+                Line::raw("LLM Chat"),
+                Line::raw("i        focus chat input"),
+                Line::raw("Enter    send prompt (when input focused)"),
+                Line::raw("Esc      exit input focus"),
+                Line::raw("Backspace edit input"),
                 Line::raw(""),
                 Line::raw("Env"),
                 Line::raw("AGENT_ENDPOINT  http://mini:8787/state"),
@@ -271,6 +397,45 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
             popup,
         );
     }
+}
+
+fn render_llm_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let outer = block("LLM").inner(area);
+    frame.render_widget(block("LLM"), area);
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(outer);
+
+    let llm_summary = Paragraph::new(llm_lines(app)).wrap(Wrap { trim: true });
+    frame.render_widget(llm_summary, parts[0]);
+
+    let chat_window = Paragraph::new(chat_lines(app))
+        .block(block("Chat"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(chat_window, parts[1]);
+
+    let input_title = if app.input_mode {
+        "Input (focused: Enter send, Esc stop)"
+    } else {
+        "Input (press i to focus)"
+    };
+    let input_style = if app.input_mode {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
+    let input = Paragraph::new(format!("> {}", app.chat_input))
+        .block(Block::default().borders(Borders::ALL).title(input_title))
+        .style(input_style)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(input, parts[2]);
 }
 
 fn block(title: &str) -> Block<'_> {
@@ -369,22 +534,27 @@ fn llm_lines(app: &App) -> Vec<Line<'static>> {
         Line::raw(format!("running models: {}", llm.model_count)),
     ];
 
-    if llm.running_models.is_empty() {
-        lines.push(Line::raw("models: (none)".to_string()));
-    } else {
-        lines.extend(
-            llm.running_models
-                .iter()
-                .take(6)
-                .map(|m| Line::raw(format!("- {m}"))),
-        );
-    }
-
     if let Some(err) = &llm.error {
         lines.push(Line::raw(format!("error: {err}")));
     }
 
     lines
+}
+
+fn chat_lines(app: &App) -> Vec<Line<'static>> {
+    if app.chat_history.is_empty() {
+        return vec![Line::raw(
+            "No chat messages yet. Press i to start typing.".to_string(),
+        )];
+    }
+
+    app.chat_history
+        .iter()
+        .rev()
+        .take(20)
+        .rev()
+        .map(|m| Line::raw(format!("{}: {}", m.role, m.content)))
+        .collect()
 }
 
 fn process_lines(app: &App) -> Vec<Line<'static>> {
@@ -396,20 +566,19 @@ fn process_lines(app: &App) -> Vec<Line<'static>> {
         return vec![Line::raw("no process data".to_string())];
     }
 
-    state
-        .system
-        .top_processes
-        .iter()
-        .map(|p| {
-            Line::raw(format!(
-                "pid={} cpu={:.1}% mem={} {}",
-                p.pid,
-                p.cpu_percent,
-                bytes_human(p.memory_bytes),
-                p.name
-            ))
-        })
-        .collect()
+    let mut lines = vec![Line::raw("ranked by avg CPU over last 5m".to_string())];
+    lines.extend(state.system.top_processes.iter().map(|p| {
+        Line::raw(format!(
+            "pid={} avg5m={:.1}% now={:.1}% n={} mem={} {}",
+            p.pid,
+            p.cpu_percent,
+            p.current_cpu_percent,
+            p.samples_5m,
+            bytes_human(p.memory_bytes),
+            p.name
+        ))
+    }));
+    lines
 }
 
 fn event_lines(app: &App) -> Vec<Line<'static>> {

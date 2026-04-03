@@ -1,0 +1,3 @@
+[workspace]
+members = ["mini-agent", "pro-tui"]
+resolver = "2"

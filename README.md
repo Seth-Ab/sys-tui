@@ -9,7 +9,7 @@ Split Rust TUI system for a Mac mini (agent) and Mac Pro (viewer).
 
 1. Create local config:
 ```bash
-cd /Users/sethabramowitz/cs-projects/sys-tui
+cd sys-tui
 cp .env.local.example .env.local
 ```
 
@@ -17,13 +17,13 @@ cp .env.local.example .env.local
 
 3. On Mac mini, run agent:
 ```bash
-cd /Users/sethabramowitz/cs-projects/sys-tui
+cd sys-tui
 ./scripts/run-mini-agent.sh
 ```
 
 4. On Mac Pro, run dashboard:
 ```bash
-cd /Users/sethabramowitz/cs-projects/sys-tui
+cd sys-tui
 ./scripts/run-pro-tui.sh
 ```
 
@@ -32,7 +32,7 @@ cd /Users/sethabramowitz/cs-projects/sys-tui
 ### 1) On Mac mini: start `mini-agent`
 
 ```bash
-cd /Users/sethabramowitz/cs-projects/sys-tui
+cd sys-tui
 TOKEN="$(openssl rand -hex 32)"
 AGENT_BIND=0.0.0.0:8787 AGENT_TOKEN="$TOKEN" cargo run -p mini-agent
 ```
@@ -47,7 +47,7 @@ Notes:
 ### 2) On Mac Pro: run `pro-tui`
 
 ```bash
-cd /Users/sethabramowitz/cs-projects/sys-tui
+cd sys-tui
 AGENT_ENDPOINT=http://<mini-host-or-ip>:8787/state AGENT_TOKEN="<same-token>" cargo run -p pro-tui
 ```
 

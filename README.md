@@ -70,17 +70,55 @@ AGENT_ENDPOINT=http://<mini-host-or-ip>:8787/state cargo run -p pro-tui
 - `AGENT_TOKEN` optional shared secret (expects `x-agent-token` header)
 - `OLLAMA_PS_URL` default: `http://127.0.0.1:11434/api/ps`
 - `WATCH_DIRS` comma-separated dirs (default: `$HOME/Downloads,$HOME/.ollama`)
+- `OLLAMA_CHAT_URL` default: `http://127.0.0.1:11434/api/generate`
+- `OLLAMA_TAGS_URL` default: `http://127.0.0.1:11434/api/tags`
+- `OLLAMA_MODEL` default: `llama3.2` (fallback chat model)
 
 ### `pro-tui`
 - `AGENT_ENDPOINT` default: `http://127.0.0.1:8787/state`
 - `AGENT_TOKEN` optional; required if agent token is enabled
+- `PRO_TUI_CONFIG` optional absolute path for persistent local config
+  - default path: `~/.config/pro-tui/config.toml`
 
 ## Keybinds (`pro-tui`)
 
+### Global (all screens)
 - `q`: quit
+- `Tab`: open screen navigator
+- `h`: open help
+- `Esc`: close active modal/input
+
+### Dashboard screen
 - `r`: refresh now
 - `e`: expand/collapse file events
-- `h`: show/hide help
+- `i`: focus chat input
+- `m`: open model selector
+- `Up/Down`: scroll chat
+
+### Chat input mode
+- `Enter`: send prompt
+- `Esc`: exit input focus
+- `Backspace`: delete character
+
+### Model selector modal
+- `Up/Down`: move
+- `Enter`: apply model
+- `Esc`: close selector
+
+### Customize screen
+- `[ / ]`: switch section (`Global`, `Dashboard`)
+- `Up/Down`: move option
+- `Left/Right`: change value
+- `Enter`: edit/apply selected option
+- `s`: save config to disk
+- `r`: reset selected option
+
+## Customize persistence
+
+- Edits in `Customize` are applied live in memory.
+- They become permanent only after pressing `s` to save.
+- Save uses an atomic write (temp file then rename).
+- Unknown config keys are preserved for forward compatibility.
 
 ## Troubleshooting
 
